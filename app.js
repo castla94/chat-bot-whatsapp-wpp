@@ -3,16 +3,16 @@ import { mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { WPPConnectProvider as Provider } from '@builderbot/provider-wppconnect'
 import { MemoryDB as Database } from '@builderbot/bot'
-import { chatbot } from './flow/chatbot.js';
-import { media } from './flow/media.js';
-import { voice } from './flow/voice.js';
+import { chatbot } from './src/flow/chatbot.js';
+import { media } from './src/flow/media.js';
+import { voice } from './src/flow/voice.js';
 import 'dotenv/config';
-import { defaultLogger } from './helpers/cloudWatchLogger.js';
+import { defaultLogger } from './src/helpers/cloudWatchLogger.js';
 import express from 'express';
-import { postWhatsappConversation } from './services/aws/index.js';
+import { postWhatsappConversation } from './src/services/aws/index.js';
 
 const app = express();
-const SRC_DIR = new URL('.', import.meta.url).pathname;
+const SRC_DIR = new URL('./src/', import.meta.url).pathname;
 const TEMP_DIR = join(SRC_DIR, 'temp');
 const MEDIA_DIR = join(SRC_DIR, 'media');
 const AUDIO_DIR = join(SRC_DIR, 'audio');
