@@ -1,0 +1,403 @@
+import { addKeyword, EVENTS } from '@builderbot/bot';
+import { run } from '../services/openai/index.js';
+import {
+    getWhatsappConversation,
+    putWhatsappEmailVendor,
+    getWhatsapp,
+    whatsappStatus,
+    getWhatsappWhitelist,
+    getWhatsappPlanPremiun,
+    putWhatsapp,
+    regexAlarm,
+    postWhatsappConversation
+} from '../services/aws/index.js';
+import fs from "fs";
+import { join } from 'path';
+import { defaultLogger } from '../helpers/cloudWatchLogger.js';
+import { processImage } from "../services/image/index.js";
+import { extractName, extractNumber, extractUserId, markMessageSeen, resolveNumber } from './providerContext.js';
+
+const MEDIA_DIR = join(new URL('..', import.meta.url).pathname, 'media');
+
+
+/**
+ * Función auxiliar para pausar la ejecución
+ * @param {number} ms - Milisegundos a esperar
+ * @returns {Promise} Promesa que se resuelve después del tiempo especificado
+ */
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+
+// Function to check premium plan status
+const checkPremiumPlan = async (userId, numberPhone, name, provider) => {
+    const isPremiun = await getWhatsappPlanPremiun()
+    defaultLogger.info('Verificación de plan', {
+        userId,
+        numberPhone,
+        name,
+        action: 'plan_verification',
+        file: 'voice.js'
+    })
+
+    if (isPremiun === null) {
+        defaultLogger.info('No tiene plan pro, finalizando flujo', {
+            userId,
+            numberPhone,
+            name,
+            action: 'without_plan',
+            file: 'media.js'
+        })
+    
+        await provider.sendMessage(numberPhone,"Lo siento, no puedo procesar tu imagen. Por favor, envíame por texto lo que necesitas consultar.", { media: null})
+
+        return true
+    }
+
+    if (isPremiun && (isPremiun.plan !== "Pro" && isPremiun.plan !== "Enterprise")) {
+        defaultLogger.info('Debe mejorar plan, finalizando flujo', {
+            userId,
+            numberPhone,
+            name,
+            action: 'without_plan_pro',
+            file: 'media.js'
+        })
+        await provider.sendMessage(numberPhone,"Lo siento, no puedo procesar tu imagen. Por favor, envíame por texto lo que necesitas consultar.", { media: null})
+        return true
+    }
+
+    return false
+}
+
+// Process alarms through dedicated method
+const processAlarm = async (ctx, numberPhone, name, question) => {
+    const hasAlarm = await regexAlarm(question)
+    defaultLogger.info('Verificación de alarma', {
+        userId: extractUserId(ctx),
+        numberPhone,
+        name,
+        messageBody: question,
+        hasAlarm,
+        action: 'alarm_check',
+        file: 'media.js'
+    })
+
+    if (hasAlarm) {
+        defaultLogger.info('Alarma encontrada, finalizando flujo', {
+            userId: extractUserId(ctx),
+            numberPhone,
+            name,
+            hasAlarm,
+            messageBody: question,
+            action: 'alarm_found',
+            file: 'media.js'
+        })
+        await putWhatsapp(numberPhone, name, false)
+        return true
+    }
+    return false
+}
+
+function extractMediaCaption(ctx) {
+    const candidates = [
+        ctx?.body,
+        ctx?.caption,
+        ctx?.message?.imageMessage?.caption,
+        ctx?.message?.videoMessage?.caption,
+        ctx?.message?.extendedTextMessage?.text,
+        ctx?.msg?.caption,
+        ctx?.msg?.body,
+        ctx?.msg?.imageMessage?.caption,
+        ctx?.msg?.message?.imageMessage?.caption,
+        ctx?.message?.documentMessage?.caption
+    ];
+
+    for (const candidate of candidates) {
+        const value = String(candidate || '').trim();
+        if (value) {
+            return value;
+        }
+    }
+
+    return '';
+}
+
+/**
+ * Flow para manejar eventos de medios (imágenes) enviados por el usuario
+ * Procesa comprobantes de pago y notifica al vendedor
+ */
+export const media = addKeyword(EVENTS.MEDIA)
+    .addAction(async (ctx, { flowDynamic, endFlow, state, provider }) => {
+        const userId = extractUserId(ctx)
+        const name = extractName(ctx)
+        const mediaCaption = extractMediaCaption(ctx)
+
+        try {
+            const numberPhone = await resolveNumber(provider, ctx)
+            defaultLogger.info('Iniciando procesamiento de imagen', {
+                userId,
+                numberPhone,
+                name,
+                mediaCaption,
+                action: 'media_received',
+                timestamp: new Date().toISOString(),
+                file: 'media.js'
+            })
+
+            // Validar si el usuario está en lista blanca
+            const isWhitelisted = await getWhatsappWhitelist(numberPhone)
+            defaultLogger.info('Verificación de whitelist', {
+                userId,
+                numberPhone,
+                name,
+                isWhitelisted,
+                action: 'whitelist_verification',
+                file: 'media.js'
+            })
+
+            if (isWhitelisted) {
+                defaultLogger.info('Usuario en whitelist, finalizando flujo', {
+                    userId,
+                    numberPhone,
+                    name,
+                    action: 'whitelist_end_flow',
+                    file: 'media.js'
+                })
+                return endFlow()
+            }
+
+            // Validar estado global del chatbot
+            const botStatus = await whatsappStatus()
+            defaultLogger.info('Estado global del bot', {
+                userId,
+                numberPhone,
+                name,
+                botStatus,
+                action: 'global_status_check',
+                file: 'media.js'
+            })
+
+            if (botStatus && !botStatus.status) {
+                defaultLogger.info('Bot desactivado globalmente', {
+                    userId,
+                    numberPhone,
+                    name,
+                    action: 'global_status_end_flow',
+                    file: 'media.js'
+                })
+                return endFlow()
+            }
+
+            // Validar estado individual del usuario
+            const userStatus = await getWhatsapp(numberPhone)
+            defaultLogger.info('Estado del usuario', {
+                userId,
+                numberPhone,
+                name,
+                userStatus,
+                action: 'user_status_check',
+                file: 'media.js'
+            })
+
+            if (userStatus && !userStatus.status) {
+                defaultLogger.info('Usuario desactivado', {
+                    userId,
+                    numberPhone,
+                    name,
+                    action: 'user_disabled_end_flow',
+                    file: 'media.js'
+                })
+
+                // Procesar y guardar la imagen recibida
+                
+                const pathImg = await provider.saveFile(ctx, { path: `${MEDIA_DIR}/` })
+
+                defaultLogger.info('Imagen guardada', {
+                    userId,
+                    numberPhone,
+                    name,
+                    pathImg,
+                    action: 'image_saved',
+                    file: 'media.js'
+                })
+                const imageBuffer = fs.readFileSync(pathImg);
+                const base64Image = imageBuffer.toString('base64');
+                await postWhatsappConversation(numberPhone, mediaCaption, "", base64Image,"imagen","user");
+
+                return endFlow()
+            }
+
+
+            // Check premium plan status
+            const shouldEndFlow = await checkPremiumPlan(userId, numberPhone, name, provider)
+            if (shouldEndFlow) return endFlow()
+
+            // Procesar y guardar la imagen recibida
+            const pathImg = await provider.saveFile(ctx, { path: `${MEDIA_DIR}/` })
+
+            defaultLogger.info('Imagen guardada', {
+                userId,
+                numberPhone,
+                name,
+                pathImg,
+                action: 'image_saved',
+                file: 'media.js'
+            })
+
+            const responseImage = await processImage(pathImg, numberPhone, name)
+
+            if (!responseImage && !userStatus.status) {
+                defaultLogger.info('Usuario desactivado', {
+                    userId,
+                    numberPhone,
+                    name,
+                    action: 'user_disabled_end_flow',
+                    file: 'media.js'
+                })
+                return endFlow()
+            }
+
+            defaultLogger.info('Respuesta del modelo obtenida Imagen', {
+                userId,
+                numberPhone,
+                name,
+                modelResponse: responseImage.text,
+                action: 'model_response',
+                file: 'media.js'
+            })
+            // Get current conversation history from state
+            const historyGlobalStatus = state.getMyState()?.history ?? []
+            // Check if there's no conversation history
+            if (historyGlobalStatus.length <= 0) {
+                // Fetch conversation history from database
+                const historyDB = await getWhatsappConversation(numberPhone);
+                defaultLogger.info('Historial de conversación recuperado de la base de datos', {
+                    userId,
+                    numberPhone,
+                    name,
+                    historyLength: historyDB?.length || 0,
+                    action: 'history_db_retrieved',
+                    file: 'media.js'
+                })
+
+                defaultLogger.info('Estado actualizado con el historial de conversación', {
+                    userId,
+                    numberPhone,
+                    name,
+                    action: 'history_state_updated',
+                    file: 'media.js'
+                })
+                await state.update({ history: historyDB })
+            }
+
+            const newHistory = (state.getMyState()?.history ?? [])
+            const questionParts = [];
+
+            if (mediaCaption) {
+                questionParts.push(`El usuario envio esta imagen con el siguiente texto o caption: "${mediaCaption}".`);
+            }
+
+            if (responseImage?.text) {
+                questionParts.push(`Contenido detectado en la imagen: *${responseImage.text}*.`);
+            }
+
+            questionParts.push('IMPORTANTE: usa el caption del usuario como contexto principal y la imagen como apoyo para responder.');
+
+            const question = questionParts.join('\n\n')
+
+            newHistory.push({
+                role: 'user',
+                content: question
+            })
+
+            // Obtener respuesta del modelo
+            const response = await run(name, newHistory, question, numberPhone, responseImage.img)
+            defaultLogger.info('Respuesta del modelo obtenida Texto Imagen', {
+                userId,
+                numberPhone,
+                name,
+                modelResponse: response,
+                action: 'model_response',
+                file: 'media.js'
+            })
+
+            // Enviar respuesta en chunks
+            //const chunks = response.split(/(?<!\d)\.(?=\s|$)|:\n\n/g)
+            const chunks = response.split(/:\n\n|\n\n/)
+
+            for (const chunk of chunks) {
+                if(numberPhone.length <= 11){
+                        await provider.sendMessage(numberPhone, chunk.replace(/^[\n]+/, '').trim(), { media: null })
+                    }else{
+                        await flowDynamic(chunk.replace(/^[\n]+/, '').trim())
+                    }
+                    await sleep(2000)
+            }
+
+            // Actualizar historial
+            newHistory.push({
+                role: 'assistant',
+                content: response
+            })
+
+            // Eliminar los primeros 2 elementos
+            // Comprobar si el array tiene más de 20 elementos
+            if (newHistory.length > 20) {
+                // Eliminar los primeros 2 elementos si tiene más de 20 elementos
+                newHistory.splice(0, 2);
+            }
+
+            await state.update({ history: newHistory })
+
+            responseImage.text = responseImage.text.replace(/\n/g, "<br>").replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
+
+            // Notificar al vendedor sobre el nuevo comprobante
+            const responseAlarm = await putWhatsappEmailVendor(
+                numberPhone,
+                name,
+                `<br><br>${responseImage.text}<br>`,
+                responseImage.img
+            )
+
+            defaultLogger.info('Notificación enviada al vendedor', {
+                userId,
+                numberPhone,
+                name,
+                responseAlarm,
+                action: 'vendor_notification_sent',
+                file: 'media.js'
+            })
+
+            // Call the alarm processing method
+            const shouldEndFlowAlarm = await processAlarm(ctx, numberPhone, name, response)
+            if (shouldEndFlowAlarm) return endFlow()
+
+            fs.unlink(pathImg, (error) => {
+                if (error) {
+                    defaultLogger.error('Error eliminando Imagen', {
+                        userId,
+                        numberPhone,
+                        name,
+                        error: error.message,
+                        action: 'delete_image',
+                        file: 'media.js'
+                    });
+                }
+            });
+
+            return endFlow()
+
+        } catch (error) {
+            defaultLogger.error('Error en flujo de medios', {
+                userId: extractUserId(ctx),
+                numberPhone: extractNumber(ctx),
+                name: extractName(ctx),
+                error: error.message,
+                stack: error.stack,
+                context: ctx,
+                file: 'media.js'
+            })
+            return endFlow()
+        }finally{
+            await markMessageSeen(provider, ctx)
+        }
+    })
