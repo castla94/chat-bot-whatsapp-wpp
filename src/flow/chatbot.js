@@ -169,7 +169,7 @@ export const chatbot = addKeyword(EVENTS.WELCOME)
             const shouldEndFlow = await processAlarm(ctx, numberPhone, name, provider, ctx.body, "user")
             if (shouldEndFlow) return endFlow()
 
-            TIMEOUT_MS = Math.floor(Math.random() * (2000 - 1000 + 1) + 1000)
+            TIMEOUT_MS = Math.floor(Math.random() * (45000 - 30000 + 1) + 30000)
 
             // Get current conversation history from state
             const historyGlobalStatus = state.getMyState()?.history ?? []
