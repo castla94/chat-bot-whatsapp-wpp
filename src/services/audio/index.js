@@ -4,6 +4,7 @@ import ffmpeg from "fluent-ffmpeg";
 import fs from "fs";
 import { join } from 'path';
 import { defaultLogger } from "../../helpers/cloudWatchLogger.js";
+import { extractName, extractUserId } from "../../flow/providerContext.js";
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 const AUDIO_DIR = join(new URL('../..', import.meta.url).pathname, 'audio');
@@ -159,8 +160,8 @@ export const convertOggMp3 = async (inputStream, outStream, userId, numberPhone,
 
 
 export const handlerAI = async (ctx,provider, phone) => {
-    const userId = ctx.key.remoteJid;
-    const name = ctx?.pushName ?? '';
+    const userId = extractUserId(ctx);
+    const name = extractName(ctx);
     const numberPhone = phone;
 
     try {
