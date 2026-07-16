@@ -44,6 +44,17 @@ const buildTempFilePath = (prefix, extension) => {
     return join(TEMP_DIR, `${prefix}_${safeTimestamp}.${extension}`);
 };
 
+const normalizeDestination = (phoneNumber) => {
+    const rawPhone = `${phoneNumber ?? ''}`.trim();
+
+    if (rawPhone.includes('@')) {
+        return rawPhone;
+    }
+
+    const normalizedPhone = rawPhone.replace(/[^\d]/g, '');
+    return `${normalizedPhone}@c.us`;
+};
+
 const main = async () => {
     try {
         mkdirSync(TEMP_DIR, { recursive: true });
@@ -60,6 +71,30 @@ const main = async () => {
            chatbot, media, voice
         ])
         const adapterProvider = createProvider(Provider);
+        let providerReady = false;
+        let providerHost = null;
+
+        adapterProvider.on('require_action', () => {
+            providerReady = false;
+            defaultLogger.warn('WPPConnect requiere accion para completar autenticacion');
+        });
+
+        adapterProvider.on('ready', () => {
+            providerReady = true;
+            defaultLogger.info('WPPConnect conectado correctamente');
+        });
+
+        adapterProvider.on('host', (host) => {
+            providerHost = host?.phone ?? null;
+            defaultLogger.info('Telefono conectado al provider', { phone: providerHost });
+        });
+
+        adapterProvider.on('auth_failure', (payload) => {
+            providerReady = false;
+            defaultLogger.error('Fallo de autenticacion de WPPConnect', {
+                payload
+            });
+        });
 
         // Crear instancia del bot
         const { httpServer } = await createBot({
@@ -90,16 +125,21 @@ const main = async () => {
             }
 
             try {
-
-                if(phoneNumber.includes('@')){
-                    await adapterProvider.sendMessage(phoneNumber, message, {});
-                }else{
-                    // Enviar el mensaje usando el número y el mensaje desde el body
-                    await adapterProvider.sendMessage(`${phoneNumber}@c.us`, message, {});
+                if (!providerReady || !adapterProvider.vendor) {
+                    defaultLogger.warn('Intento de envio sin provider listo', {
+                        phoneNumber,
+                        providerReady,
+                        providerHost
+                    });
+                    return res.status(503).send({ error: "WhatsApp aun no esta conectado" });
                 }
 
+                const destination = normalizeDestination(phoneNumber);
+
+                await adapterProvider.sendMessage(destination, message, {});
+
                 defaultLogger.info('Mensaje Manual Enviado', {
-                    phoneNumber,
+                    phoneNumber: destination,
                     messageBody: message,
                     timestamp: new Date().toISOString()
                 });
@@ -136,6 +176,16 @@ const main = async () => {
             }
 
             try {
+                if (!providerReady || !adapterProvider.vendor) {
+                    defaultLogger.warn('Intento de envio de media sin provider listo', {
+                        phoneNumber,
+                        providerReady,
+                        providerHost
+                    });
+                    return res.status(503).send({ error: "WhatsApp aun no esta conectado" });
+                }
+
+                const destination = normalizeDestination(phoneNumber);
 
                 // Paso 1: base64 (sin encabezado "data:image/jpeg;base64,...")
                 const base64Data = base64Media.includes(',')
@@ -149,7 +199,7 @@ const main = async () => {
                     // Paso 2: guardar archivo temporal
                     filePath = buildTempFilePath('imagen', fileExtension);
                     writeFileSync(filePath, base64Data, 'base64');
-                    await adapterProvider.sendImage(`${phoneNumber}@c.us`, filePath, message);
+                    await adapterProvider.sendImage(destination, filePath, message);
 
                 }
                 if(type == 'file'){
@@ -157,14 +207,14 @@ const main = async () => {
                     // Paso 2: guardar archivo temporal
                     filePath = buildTempFilePath('file', fileExtension);
                     writeFileSync(filePath, base64Data, 'base64');
-                    await adapterProvider.sendFile(`${phoneNumber}@c.us`, filePath);
+                    await adapterProvider.sendFile(destination, filePath);
                     if(message!==''){
-                        await adapterProvider.sendMessage(`${phoneNumber}@c.us`, message, {});
+                        await adapterProvider.sendMessage(destination, message, {});
                     }
                 }
 
                 defaultLogger.info(type+' Manual Enviado', {
-                    phoneNumber,
+                    phoneNumber: destination,
                     messageBody: type+": " + message,
                     timestamp: new Date().toISOString()
                 });
