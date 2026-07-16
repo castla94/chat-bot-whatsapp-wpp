@@ -92,10 +92,10 @@ const main = async () => {
             try {
 
                 if(phoneNumber.includes('@')){
-                    await adapterProvider.sendText(phoneNumber, message);
+                    await adapterProvider.sendMessage(phoneNumber, message);
                 }else{
                     // Enviar el mensaje usando el número y el mensaje desde el body
-                    await adapterProvider.sendText(`${phoneNumber}@c.us`, message);
+                    await adapterProvider.sendMessage(`${phoneNumber}@c.us`, message);
                 }
 
                 defaultLogger.info('Mensaje Manual Enviado', {
@@ -159,7 +159,7 @@ const main = async () => {
                     writeFileSync(filePath, base64Data, 'base64');
                     await adapterProvider.sendFile(`${phoneNumber}@c.us`, filePath);
                     if(message!==''){
-                        await adapterProvider.sendText(`${phoneNumber}@c.us`, message);
+                        await adapterProvider.sendMessage(`${phoneNumber}@c.us`, message);
                     }
                 }
 
