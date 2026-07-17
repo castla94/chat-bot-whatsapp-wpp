@@ -74,28 +74,7 @@ const main = async () => {
         let providerReady = false;
         let providerHost = null;
 
-        adapterProvider.on('require_action', () => {
-            providerReady = false;
-            defaultLogger.warn('WPPConnect requiere accion para completar autenticacion');
-        });
-
-        adapterProvider.on('ready', () => {
-            providerReady = true;
-            defaultLogger.info('WPPConnect conectado correctamente');
-        });
-
-        adapterProvider.on('host', (host) => {
-            providerHost = host?.phone ?? null;
-            defaultLogger.info('Telefono conectado al provider', { phone: providerHost });
-        });
-
-        adapterProvider.on('auth_failure', (payload) => {
-            providerReady = false;
-            defaultLogger.error('Fallo de autenticacion de WPPConnect', {
-                payload
-            });
-        });
-
+    
         // Crear instancia del bot
         const { httpServer } = await createBot({
         flow: adapterFlow,
