@@ -1,4 +1,5 @@
 // Solo consultas: no conecta WhatsApp, no consulta IA y no envía mensajes.
+require('../src/env').loadEnv();
 process.env.CLOUDWATCH_ENABLED = 'false';
 
 async function main() {

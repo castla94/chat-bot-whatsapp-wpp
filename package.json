@@ -5,11 +5,11 @@
   "description": "Bot de WhatsApp con WPPConnect",
   "main": "src/index.js",
   "scripts": {
-    "start": "node --env-file-if-exists=.env src/index.js",
-    "dev": "node --env-file-if-exists=.env --watch src/index.js",
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
     "check": "node scripts/check-syntax.cjs",
     "test": "node --test",
-    "diagnose": "node --env-file-if-exists=.env scripts/diagnose.cjs",
+    "diagnose": "node scripts/diagnose.cjs",
     "audit:migration": "node scripts/audit-migration.cjs"
   },
   "engines": {

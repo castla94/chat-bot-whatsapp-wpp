@@ -13,6 +13,8 @@ npm start
 
 El `.env` del proyecto de origen ya fue copiado localmente, conservando las variables existentes en el destino. No se versiona. Para una instalación nueva, copia `.env.example` a `.env` y completa `OPENAI_API_KEY`, `EMAIL_TOKEN` y la configuración de AWS que uses.
 
+El arranque carga `.env` mediante una ruta absoluta a la raíz del proyecto antes de leer la configuración o validar credenciales. Esto funciona también al ejecutar `node src/index.js` directamente desde PM2 y desde otro directorio. Las variables externas no vacías tienen prioridad; las vacías se completan desde `.env`. El log de configuración muestra `envFile` sin imprimir las credenciales. Después de actualizar el código en el servidor, reinicia el proceso con `pm2 restart NOMBRE_DEL_BOT --update-env`. Configura el `cwd` de PM2 a la raíz del proyecto para que también los archivos temporales de los flujos usen ese directorio.
+
 Cuando aparezca `QR disponible`, escanéalo desde **WhatsApp → Dispositivos vinculados → Vincular un dispositivo**. También puedes abrir `bot.qr.png`: cada renovación sobrescribe esa misma imagen. Se elimina al vincular la cuenta o cerrar el proceso normalmente.
 
 Si el QR tarda en aparecer:

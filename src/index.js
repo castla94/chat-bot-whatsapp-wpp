@@ -1,3 +1,6 @@
+const { loadEnv, envPath } = require('./env');
+loadEnv();
+
 const wppconnect = require('@wppconnect-team/wppconnect');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -42,7 +45,7 @@ process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
 async function main() {
   for (const key of ['OPENAI_API_KEY', 'EMAIL_TOKEN']) {
-    if (!process.env[key]?.trim()) throw new Error(`Falta configurar ${key} en .env.`);
+    if (!process.env[key]?.trim()) throw new Error(`Falta configurar ${key} en ${envPath}.`);
   }
   for (const directory of ['audio', 'media', 'temp']) {
     fs.mkdirSync(path.resolve(__dirname, '..', directory), { recursive: true });
@@ -50,6 +53,7 @@ async function main() {
   const business = await loadBusiness();
   business.logger.info('Configuración activa del bot', {
     session: config.session, sessionDirectory: config.folderNameToken,
+    envFile: envPath,
     headless: config.headless, apiHost: config.apiHost, apiPort: config.apiPort,
     silenceTextAudioSeconds: process.env.SILENCE_TEXT_AUDIO_SECONDS || '5',
     silenceImageSeconds: 45, model: 'gpt-5-mini',
