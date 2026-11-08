@@ -1,13 +1,10 @@
 import OpenAI from "openai";
-import { path as ffmpegPath } from "@ffmpeg-installer/ffmpeg";
+import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import ffmpeg from "fluent-ffmpeg";
 import fs from "fs";
-import { join } from 'path';
 import { defaultLogger } from "../../helpers/cloudWatchLogger.js";
-import { extractName, extractUserId } from "../../flow/providerContext.js";
 
-ffmpeg.setFfmpegPath(ffmpegPath);
-const AUDIO_DIR = join(new URL('../..', import.meta.url).pathname, 'audio');
+ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || ffmpegInstaller.path);
 
 export const textToVoice = async (userId, numberPhone, name, textToVoice) => {
 
@@ -46,7 +43,7 @@ export const textToVoice = async (userId, numberPhone, name, textToVoice) => {
         });
 
         // Write audio data to a file
-        var pathAudio = join(AUDIO_DIR, `voice-note-${Date.now()}-${numberPhone}.opus`);
+        var pathAudio = `${process.cwd()}/audio/voice-note-${Date.now()}-${numberPhone}.opus`;
 
         defaultLogger.info('Guardando archivo de audio', {
             userId,
@@ -57,7 +54,7 @@ export const textToVoice = async (userId, numberPhone, name, textToVoice) => {
             file: 'audio/index.js'
         });
 
-        fs.writeFileSync(
+        await fs.writeFileSync(
             pathAudio,
             Buffer.from(response.choices[0].message.audio.data, 'base64'),
             { encoding: "utf-8" }
@@ -132,7 +129,7 @@ export const convertOggMp3 = async (inputStream, outStream, userId, numberPhone,
             .audioQuality(96)
             .toFormat("mp3")
             .save(outStream)
-            .on("progress", () => null)
+            .on("progress", (p) => null)
             .on("end", () => {
                 defaultLogger.info('Conversión de audio completada', {
                     userId,
@@ -160,14 +157,14 @@ export const convertOggMp3 = async (inputStream, outStream, userId, numberPhone,
 
 
 export const handlerAI = async (ctx,provider, phone) => {
-    const userId = extractUserId(ctx);
-    const name = extractName(ctx);
+    const userId = ctx.key.remoteJid;
+    const name = ctx?.pushName ?? '';
     const numberPhone = phone;
 
     try {
-        const pathImg = await provider.saveFile(ctx, { path: `${AUDIO_DIR}/` })
+        const pathImg = await provider.saveFile(ctx, {path:`${process.cwd()}/audio/`})
         const pathTmpOgg = pathImg;
-        const pathTmpMp3 = join(AUDIO_DIR, `voice-note-${Date.now()}-${phone}.mp3`);
+        const pathTmpMp3 = `${process.cwd()}/audio/voice-note-${Date.now()}-${phone}.mp3`;
 
         await convertOggMp3(pathTmpOgg, pathTmpMp3, userId, numberPhone, name);
         const text = await voiceToText(pathTmpMp3, userId, numberPhone, name);

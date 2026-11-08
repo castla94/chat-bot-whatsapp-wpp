@@ -1,10 +1,23 @@
 dist/*
 node_modules
+.node_modules.backup-libvips/
+*.backup-libvips
 .env
 
 *_sessions
+/bot_sessions/
 *tokens
 .wwebjs*
 
 *.log
 *qr.png
+
+.DS_Store
+/userDataDir/
+/audio/
+/media/
+/temp/
+/sessions_history/
+/logs/
+.env.*
+!.env.example

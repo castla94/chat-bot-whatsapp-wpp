@@ -6,8 +6,96 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
+    apiKey: process.env.OPENAI_API_KEY,
+    timeout: Number(process.env.OPENAI_TIMEOUT_MS) || 120000,
+    maxRetries: 1,
 });
+
+const isEnvTrue = (value) => {
+    const normalized = String(value || '').trim().toLowerCase();
+    return ['true', '1', 'yes', 'on', 'si', 's'].includes(normalized);
+};
+
+const ENABLE_MODEL_CLASSIFICATION = isEnvTrue(process.env.ENABLE_MODEL_CLASSIFICATION);
+const DEFAULT_OPENAI_MODEL = "gpt-4.1-mini";
+
+const extractDate = (message) => {
+    const regex = /\b(\d{1,2})[\/-](\d{1,2})[\/-](\d{2}|\d{4})\b/;
+
+    const match = String(message || '').match(regex);
+
+    if (!match) {
+        return null;
+    }
+
+    let [, day, month, year] = match;
+
+    day = day.padStart(2, '0');
+    month = month.padStart(2, '0');
+
+    if (year.length === 2) {
+        year = `20${year}`;
+    }
+
+    const date = new Date(
+        Number(year),
+        Number(month) - 1,
+        Number(day)
+    );
+
+    const valid =
+        date.getFullYear() === Number(year) &&
+        date.getMonth() === Number(month) - 1 &&
+        date.getDate() === Number(day);
+
+    if (!valid) {
+        return null;
+    }
+
+    return {
+        original: match[0],
+        display: `${day}-${month}-${year}`,
+        iso: `${year}-${month}-${day}`
+    };
+};
+
+const resolveOpenAIQuestion = (requiresStrongModel, question) => {
+    if (!requiresStrongModel) {
+        return {
+            finalQuestion: question,
+            dateExtracted: null,
+            dateApplied: false
+        };
+    }
+
+    const dateExtracted = extractDate(question);
+    const finalQuestion = dateExtracted ? dateExtracted.display : question;
+
+    return {
+        finalQuestion,
+        dateExtracted,
+        dateApplied: Boolean(dateExtracted)
+    };
+};
+
+const resolveModelSelection = async (question) => {
+    if (!ENABLE_MODEL_CLASSIFICATION) {
+        return {
+            modelSelected: "gpt-5-mini",
+            classification: null,
+            classificationEnabled: false
+        };
+    }
+
+    const classification = await classifyIntent(question);
+    const modelSelected = "gpt-5-mini";//classification?.requires_strong_model ? "gpt-4o" : DEFAULT_OPENAI_MODEL;
+
+    return {
+        modelSelected,
+        classification,
+        classificationEnabled: true
+    };
+};
 
 export const calculateCostInDollars = (promptTokens, completionTokens) => {
     const inputCost = (promptTokens / 1000) * 0.00015;
@@ -23,7 +111,7 @@ export const calculateCredits = (promptTokens, completionTokens) => {
 
 export async function processTokenUsage(responseOpenAI, availableCredits, userId, numberPhone, name) {
     const { prompt_tokens, completion_tokens } = responseOpenAI.usage;
-    
+
     defaultLogger.info('Créditos disponibles', {
         userId,
         numberPhone,
@@ -34,7 +122,7 @@ export async function processTokenUsage(responseOpenAI, availableCredits, userId
     });
 
     const cost = 1//calculateCredits(prompt_tokens, completion_tokens);
-    
+
     defaultLogger.info('Costo de operación calculado', {
         userId,
         numberPhone,
@@ -60,20 +148,43 @@ export async function processTokenUsage(responseOpenAI, availableCredits, userId
 
 
 
-export const runAnalyzeImage = async (base64Image,phone,name) => {
+export const runAnalyzeImage = async (base64Image, phone, name, overrideMime = null) => {
 
     const userId = phone; // Usando el teléfono como userId por consistencia
     const numberPhone = phone;
 
     try {
+        // ============================================================
+        // DETECTAR MIME REAL (webp/jpg/png) sin confiar en nombre de archivo.
+        // GPT-4.1-mini SOPORTA image/webp oficialmente. Si lo mandamos
+        // como image/jpeg cuando en realidad es webp, la API lo rechaza.
+        // Inferimos por magic numbers:
+        //   /9j/ → jpg
+        //   iVBOR → png
+        //   UklGR → webp (RIFF container)
+        // Fallback: image/jpeg (no rompe si overrideMime fue provisto).
+        // ============================================================
+        const detectMimeFromBase64 = (b64) => {
+            const head = String(b64 || '').slice(0, 8);
+            if (head.startsWith('/9j/')) return 'image/jpeg';
+            if (head.startsWith('iVBOR')) return 'image/png';
+            if (head.startsWith('UklGR')) return 'image/webp';
+            return 'image/jpeg';
+        };
+
+        const detectedMime = (overrideMime && /^image\//i.test(overrideMime))
+            ? String(overrideMime).toLowerCase()
+            : detectMimeFromBase64(base64Image);
 
         const availableCredits = await getWhatsappCredit();
-        
+
         defaultLogger.info('Verificando créditos para consulta', {
             userId,
             numberPhone,
             name,
             availableCredits,
+            imageDetectedMime: detectedMime,
+            imageBase64Length: String(base64Image || '').length,
             action: 'credit_check',
             file: 'openai/index.js'
         });
@@ -101,7 +212,7 @@ export const runAnalyzeImage = async (base64Image,phone,name) => {
                         },
                         {
                             type: "image_url",
-                            image_url: { url: `data:image/jpeg;base64,${base64Image}` }
+                            image_url: { url: `data:${detectedMime};base64,${base64Image}` }
                         },
                     ],
                 },
@@ -278,7 +389,7 @@ function hasDateLikeReference(question) {
         /\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b/,
         /\b\d{1,2}\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)(\s+de\s+\d{4})?\b/,
         /\b(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\s+\d{1,2}\b/,
-        /\b(hoy|manana|mañana|ayer|pasado manana|pasado mañana|proximo|próximo|este|semana proxima|semana próxima|fin de semana|mes que viene|mes proximo|mes próximo)\b/,
+        /\b(hoy|manana|mañana|ayer|pasado manana|pasado mañana|proximo|próximo|semana proxima|semana próxima|fin de semana|mes que viene|mes proximo|mes próximo)\b/,
         /\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/,
         /\b(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b/
     ];
@@ -293,7 +404,7 @@ export const run = async (name, history, question, phone,imageBase64 = "") => {
 
     try {
         const availableCredits = await getWhatsappCredit();
-        
+
         defaultLogger.info('Verificando créditos para consulta', {
             userId,
             numberPhone,
@@ -314,29 +425,50 @@ export const run = async (name, history, question, phone,imageBase64 = "") => {
             return "¡Hola! 👋 Gracias por contactarnos. En este momento no podemos atender tu consulta, pero no te preocupes, nos pondremos en contacto contigo lo antes posible. 🙏\nSi necesitas ayuda urgente, puedes dejar un mensaje con los detalles de tu consulta, y te responderemos tan pronto como podamos.\n¡Gracias por tu paciencia! 😊";
         }
 
-        const prompt = await generatePrompt(name, question);
-        const classification = await classifyIntent(question);
-        const modelSelected = classification?.requires_strong_model ? "gpt-4o" : "gpt-4.1-mini";
+        const prompt = await generatePrompt(name, question, phone);
+        const { modelSelected, classification, classificationEnabled } = await resolveModelSelection(question);
+        const { finalQuestion, dateExtracted, dateApplied } = resolveOpenAIQuestion(classification?.requires_strong_model, question);
         defaultLogger.info('Modelo seleccionado para consulta', {
             userId,
             numberPhone,
             name,
+            originalQuestion: question,
+            finalQuestion,
             modelSelected,
             classification,
+            classificationEnabled,
+            defaultModel: DEFAULT_OPENAI_MODEL,
+            enableModelClassification: ENABLE_MODEL_CLASSIFICATION,
+            dateExtracted,
+            dateApplied,
             action: 'model_selection',
             file: 'openai/index.js'
         });
 
+        const requestStartedAt = Date.now();
+        defaultLogger.info('Consultando OpenAI', {
+            numberPhone, model: modelSelected, question: finalQuestion,
+            historyLength: history.length, action: 'openai_request_start',
+        });
         const response = await openai.chat.completions.create({
             model: modelSelected,
+            ...(modelSelected === "gpt-5-mini" ? { reasoning_effort: "low" } : {}),
             messages: [
-                { role: "system", content: prompt },
-                ...history
+                { role: "developer", content: prompt },
+                ...history,
+                { role: "user", content: finalQuestion }
             ],
-            temperature: 0,
-            top_p: 1,
-            frequency_penalty: 0,
-            presence_penalty: 0,
+            ...(modelSelected === "gpt-5-mini" ? {} : {
+                temperature: 0, top_p: 1, frequency_penalty: 0, presence_penalty: 0,
+            }),
+        });
+        if (!response.choices?.[0]?.message?.content?.trim()) {
+            throw new Error('OpenAI devolvió una respuesta sin texto.');
+        }
+        defaultLogger.info('OpenAI respondió la consulta', {
+            numberPhone, model: modelSelected, elapsedMs: Date.now() - requestStartedAt,
+            response: response.choices[0].message.content,
+            action: 'openai_request_success',
         });
         const type = imageBase64 !== "" ? 'imagen' : '';
         await postWhatsappConversation(phone, question, response.choices[0].message.content,imageBase64,type);
@@ -351,6 +483,10 @@ export const run = async (name, history, question, phone,imageBase64 = "") => {
             error: error.message,
             stack: error.stack,
             action: 'run_error',
+            status: error.status,
+            code: error.code,
+            param: error.param,
+            requestId: error.request_id,
             file: 'openai/index.js'
         });
         throw error;
@@ -364,7 +500,7 @@ export const runDetermine = async (history, phone) => {
 
     try {
         const availableCredits = await getWhatsappCredit();
-        
+
         defaultLogger.info('Verificando créditos para determinación', {
             userId,
             numberPhone,
@@ -446,10 +582,10 @@ export const runUpdatePromptServicesProduct = async (text) => {
                 "Maneja la información específica de fechas con precisión y valida todos los cambios de inventario." +
                 "Debes respetar el formato de prompt_servicio_productos y retornar la nueva informacion actualizada en el mismo formato"
             },
-            { role: "user", content: `Tienes este contenido y necesito que lo tomes como referencia para 
+            { role: "user", content: `Tienes este contenido y necesito que lo tomes como referencia para
                 actualizar la informacon: ${whatsappPrompt.products} luego ajustar de acuerdo a estos datos, modifica el formato de la informacion original
-                 solo que cambia las partes necesarias para actualizar la informacion  y ademas responde en formato text 
-                 y manten tambien el formato original no añadas informacion adicional solo el horario asignado para que 
+                 solo que cambia las partes necesarias para actualizar la informacion  y ademas responde en formato text
+                 y manten tambien el formato original no añadas informacion adicional solo el horario asignado para que
                  quede ocupado o el stock al inventario sea el canso que corresponda: ${text}` },
         ],
     });

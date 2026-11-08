@@ -1,10 +1,9 @@
-import { addKeyword, EVENTS } from '@builderbot/bot'
 import { handlerAI } from "../services/audio/index.js"
-import { run, runUpdatePromptServicesProduct } from '../services/openai/index.js'   
-import { 
+import { run, runUpdatePromptServicesProduct } from '../services/openai/index.js'
+import {
     getWhatsapp,
     putWhatsapp,
-    whatsappStatus, 
+    whatsappStatus,
     regexAlarm,
     putWhatsappEmailVendor,
     getWhatsappWhitelist,
@@ -15,11 +14,73 @@ import {
     postWhatsappConversation,
     getWhatsappPlanPremiun
 } from '../services/aws/index.js'
-import { setTimeout } from 'timers/promises'
 import { defaultLogger } from '../helpers/cloudWatchLogger.js'
-import { extractName, extractNumber, extractUserId, markMessageSeen, resolveNumber } from './providerContext.js'
+import { getProfilePictureInfo } from '../helpers/whatsappProfile.js'
+import {
+    markMessageReady,
+    waitForTurn,
+    isStillMyTurn,
+    clearConversationAfterResponse,
+    buildCombinedInput,
+    getConversationState,
+    getCurrentVersion,
+    consumeLatestPendingOfType,
+    waitForMyMessageEntryInBuffer,
+    isRafagaVivaActive,
+    isGreetingResetTrigger
+} from '../helpers/conversationBuffer.js'
 
- 
+// ============================================================
+// KEEP-ALIVE DE PRESENCIA ("escribiendo…")
+// ============================================================
+// WhatsApp Baileys borra el estado "composing" tras ~15s de inactividad.
+// Refrescamos cada PRESENCE_REFRESH_MS hasta stop().
+// ============================================================
+const PRESENCE_REFRESH_MS = 10 * 1000
+const startPresenceKeepAlive = (provider, jid, { presenceType = 'composing', file = 'voice.js' } = {}) => {
+    let stopped = false
+    let refreshTimer = null
+    const fireAndForgetSend = () => {
+        if (stopped || !provider || !provider?.vendor?.sendPresenceUpdate || !jid) return
+        ;(async () => {
+            try {
+                await provider.vendor.sendPresenceUpdate(presenceType, jid)
+                defaultLogger.debug('Presence keep-alive reenviado (audio flow)', {
+                    jid, presenceType,
+                    action: 'presence_keepalive_refresh',
+                    file
+                })
+            } catch (e) {
+                defaultLogger.debug('Presence keep-alive error silencioso (audio flow)', {
+                    jid, presenceType,
+                    error: e?.message || String(e),
+                    action: 'presence_keepalive_error_swallowed',
+                    file
+                })
+            }
+        })()
+    }
+    fireAndForgetSend()
+    refreshTimer = setInterval(fireAndForgetSend, PRESENCE_REFRESH_MS)
+    const stop = async () => {
+        if (stopped) return
+        stopped = true
+        if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null }
+        try {
+            if (provider?.vendor?.sendPresenceUpdate && jid) {
+                await provider.vendor.sendPresenceUpdate('paused', jid)
+                defaultLogger.debug('Presence keep-alive detenido → paused (audio flow)', {
+                    jid, presenceType,
+                    action: 'presence_keepalive_stopped',
+                    file
+                })
+            }
+        } catch (_) {}
+    }
+    return { stop }
+}
+
+
 // Function to check premium plan status
 const checkPremiumPlan = async (userId, numberPhone, name, provider) => {
     const isPremiun = await getWhatsappPlanPremiun()
@@ -39,12 +100,12 @@ const checkPremiumPlan = async (userId, numberPhone, name, provider) => {
             action: 'without_plan',
             file: 'voice.js'
         })
-        
+
         await provider.sendMessage(numberPhone,"Lo siento, no puedo procesar notas de voz en este momento. Por favor, escribe tu consulta en un mensaje de texto.", { media: null})
 
         return true
     }
-    console.log("isPremiun",isPremiun)
+    defaultLogger.info('isPremiun', isPremiun)
     if (isPremiun && (isPremiun.plan !== "Pro" && isPremiun.plan !== "Enterprise")) {
         defaultLogger.info('Debe mejorar plan, finalizando flujo', {
             userId,
@@ -63,59 +124,130 @@ const checkPremiumPlan = async (userId, numberPhone, name, provider) => {
 }
 
 
+function extractNumber(ctx) {
+    try {
+        // El adaptador WPPConnect resuelve LID y entrega el teléfono real.
+        if (!ctx.from) throw new Error('No se pudo resolver el teléfono del contacto')
+        return ctx.from
+    } catch (error) {
+        defaultLogger.error('Error extrayendo número', {
+            error: error.message, stack: error.stack, context: ctx,
+            action: 'extract_number_error', file: 'chatbot.js'
+        })
+        return ctx.from
+    }
+}
+
 /**
  * Flujo para manejar notas de voz
  * Procesa el audio, lo convierte a texto y genera respuestas
  */
-export const voice = addKeyword(EVENTS.VOICE_NOTE)
-    // Primera acción: Validación inicial y análisis de intención
-    .addAction(async (ctx, { state, endFlow, provider }) => {
-        const userId = extractUserId(ctx)
-        const name = extractName(ctx)
+export const voice = async (ctx, { state, endFlow, flowDynamic, provider }) => {
+        let presence = null
+        const userId = ctx.key.remoteJid
+        const name = ctx?.pushName ?? ''
+        const numberPhone = extractNumber(ctx)
 
         try {
-            const numberPhone = await resolveNumber(provider, ctx)
-            defaultLogger.info('Iniciando procesamiento de nota de voz', {
-                userId,
-                numberPhone,
-                name,
+            const { profilePictureUrl } = await getProfilePictureInfo(ctx, provider, {
+                userId, numberPhone, name, file: 'voice.js'
+            })
+            defaultLogger.info('Iniciando procesamiento de nota de voz (único addAction)', {
+                userId, numberPhone, name, profilePictureUrl,
                 action: 'voice_note_received',
                 file: 'voice.js'
             })
 
-            // Validar si el usuario está en lista blanca
+            // ================ COORDINACIÓN COMPARTIDA ================
+            // ✅ NUEVA LÓGICA: esperar a que ESTE mensaje esté en el buffer
+            // (por race condition nuestro listener Baileys puede correrse DESPUÉS de BBot).
+            // Cuando encontramos la entry de AUDIO propia → tomamos entry.version como flowVersion.
+            let {
+                version: myVersion,
+                entryId: myAudioEntryId,
+                matchedBy: myMatchType
+            } = await waitForMyMessageEntryInBuffer(numberPhone, {
+                type: 'audio',
+                messageId: ctx?.key?.id || null,
+                contentCandidate: '', // audio no tiene contenido de texto directo (lo buscamos por id/type)
+                file: 'voice.js'
+            })
+            // GUARD: timeout sin entry → skip camino coordinado (va a legacy
+            // sin esperar 8s del watchdog de waitForTurn).
+            if (myMatchType === 'timeout_fallback_global_version' && Number(myVersion || 0) <= 0) {
+                defaultLogger.warn('WaitForMyEntry timeout → camino LEGACY (audio sin coordinación). Listener Baileys no insertó mensaje en buffer', {
+                    userId, numberPhone, name,
+                    myMatchType,
+                    fallbackVersion: Number(myVersion || 0),
+                    action: 'conversation_flow_skip_coordinated_timeout_myentry',
+                    file: 'voice.js'
+                })
+                myVersion = 0
+                if (myAudioEntryId) myAudioEntryId = null
+            }
+            // ============================================================
+            // GUARD "RESPUESTA FANTASMA": si el audio YA fue respondido
+            // (su entry ya fue limpiada), NO caer a legacy ni responder de nuevo.
+            // ============================================================
+            if (myMatchType === 'already_answered') {
+                defaultLogger.info('Audio: mensaje YA respondido previamente → flujo termina en silencio (evita respuesta fantasma)', {
+                    userId, numberPhone, name,
+                    messageId: ctx?.key?.id || null,
+                    action: 'conversation_voice_already_answered_skip',
+                    file: 'voice.js'
+                })
+                return endFlow()
+            }
+            let pendingAudio = myAudioEntryId ? { entryId: myAudioEntryId } : consumeLatestPendingOfType(numberPhone, 'audio')
+            const convStateBefore = getConversationState(numberPhone)
+            defaultLogger.info('Conversación compartida (audio - snapshot después de encontrar mi entry)', {
+                userId, numberPhone, name,
+                phoneKey: convStateBefore.phoneKey,
+                myVersion,
+                myAudioEntryId,
+                myMatchType,
+                pendingAudioEntryId: pendingAudio ? pendingAudio.entryId : null,
+                pendingAudioMessageId: pendingAudio ? pendingAudio.messageId : null,
+                pendingAudioReceivedAt: pendingAudio && pendingAudio.receivedAt ? new Date(pendingAudio.receivedAt).toISOString() : null,
+                currentVersion: convStateBefore.version,
+                bufferCount: convStateBefore.bufferCount,
+                meaningfulCount: convStateBefore.meaningfulCount,
+                bufferTypes: convStateBefore.bufferTypes,
+                lastActivityAt: convStateBefore.lastActivityAt ? new Date(convStateBefore.lastActivityAt).toISOString() : null,
+                action: 'conversation_flow_init_audio',
+                file: 'voice.js'
+            })
+            const cur = state.getMyState() || {}
+            await state.update({
+                ...cur,
+                conversationVersion: myVersion,
+                conversationPhoneKey: convStateBefore.phoneKey,
+                conversationEntryId: pendingAudio ? pendingAudio.entryId : null
+            })
+            // =========================================================
+
+            // ============ VALIDACIONES (SOLO UNA VEZ - ya no son 2 veces en 2 acciones) ============
             const isWhitelisted = await getWhatsappWhitelist(numberPhone)
             defaultLogger.info('Verificación de whitelist', {
-                userId,
-                numberPhone,
-                name,
-                isWhitelisted,
+                userId, numberPhone, name, isWhitelisted,
                 action: 'whitelist_verification',
                 file: 'voice.js'
             })
-
             if (isWhitelisted) {
                 defaultLogger.info('Usuario en whitelist, finalizando flujo', {
-                    userId,
-                    numberPhone,
-                    name,
+                    userId, numberPhone, name,
                     action: 'whitelist_end_flow',
                     file: 'voice.js'
                 })
                 return endFlow()
             }
 
-            // Validar estado global del chatbot
             const botStatus = await whatsappStatus()
             defaultLogger.info('Estado global del bot', {
-                userId,
-                numberPhone,
-                name,
-                botStatus,
+                userId, numberPhone, name, botStatus,
                 action: 'global_status_check',
                 file: 'voice.js'
             })
-
             if (botStatus && !botStatus.status) {
                 defaultLogger.info('Bot desactivado globalmente', {
                     action: 'global_status_end_flow',
@@ -124,298 +256,362 @@ export const voice = addKeyword(EVENTS.VOICE_NOTE)
                 return endFlow()
             }
 
-            // Validar estado individual del usuario
-            const userStatus = await getWhatsapp(numberPhone)
+            let userStatus = await getWhatsapp(numberPhone, { name, profilePictureUrl })
             defaultLogger.info('Estado del usuario', {
-                userId,
-                numberPhone,
-                name,
-                userStatus,
+                userId, numberPhone, name, userStatus,
                 action: 'user_status_check',
                 file: 'voice.js'
             })
 
-            if (userStatus && !userStatus.status) {
+             if (userStatus && !userStatus.status) {
                 defaultLogger.info('Usuario desactivado', {
-                    userId,
-                    numberPhone,
-                    name,
+                    userId, numberPhone, name,
                     action: 'user_disabled_end_flow',
                     file: 'voice.js'
                 })
                 return endFlow()
             }
 
-            // Check premium plan status
-            const shouldEndFlow = await checkPremiumPlan(userId, numberPhone, name, provider)
-            if (shouldEndFlow) return endFlow()
+            // Actualizar usuario NUEVO (antes solo se hacía en segunda acción)
+            if (!userStatus) {
+                 await putWhatsapp(numberPhone, name, true, profilePictureUrl)
+                defaultLogger.info('Nuevo usuario registrado', {
+                    userId, numberPhone, name, newUserStatus: userStatus,
+                    action: 'new_user_registration',
+                    file: 'voice.js'
+                })
+            }
 
-            // Get current conversation history from state
+
+            // Check premium plan
+            const shouldEndPremium = await checkPremiumPlan(userId, numberPhone, name, provider)
+            if (shouldEndPremium) return endFlow()
+
+            // ===== HISTORIAL =====
             const historyGlobalStatus = state.getMyState()?.history ?? []
-            // Check if there's no conversation history
-            if(historyGlobalStatus.length <= 0){
-                // Fetch conversation history from database
+            if (historyGlobalStatus.length <= 0) {
                 const historyDB = await getWhatsappConversation(numberPhone);
                 defaultLogger.info('Historial de conversación recuperado de la base de datos', {
-                    userId,
-                    numberPhone,
-                    name,
+                    userId, numberPhone, name,
                     historyLength: historyDB?.length || 0,
                     action: 'history_db_retrieved',
                     file: 'voice.js'
                 })
-
                 defaultLogger.info('Estado actualizado con el historial de conversación', {
-                    userId,
-                    numberPhone,
-                    name,
+                    userId, numberPhone, name,
                     action: 'history_state_updated',
                     file: 'voice.js'
                 })
                 await state.update({ history: historyDB })
             }
 
-
-        } catch (error) {
-            defaultLogger.error('Error en primera acción de voz', {
-                userId,
-                numberPhone,
-                name,
-                error: error.message,
-                stack: error.stack,
-                context: ctx,
-                file: 'voice.js'
+            // ===== KEEP-ALIVE PRESENCIA "escribiendo…" =====
+            // Mantener estado durante: transcripción + polling de 25s + IA + respuesta.
+            // WhatsApp borra composing tras ~15s → refrescamos cada 10s.
+            presence = startPresenceKeepAlive(provider, ctx.key.remoteJid, {
+                presenceType: 'composing', file: 'voice.js'
             })
-            return endFlow()
-        }
-    })
-    // Segunda acción: Procesamiento de audio y generación de respuesta
-    .addAction(async (ctx, { endFlow, state, provider }) => {
-        const userId = extractUserId(ctx)
-        const name = extractName(ctx)
-
-        try {
-            const numberPhone = await resolveNumber(provider, ctx)
-            defaultLogger.info('Iniciando segunda acción de voz', {
-                userId,
-                numberPhone,
-                name,
-                action: 'second_action_start',
-                file: 'voice.js'
-            })
-
-            // Validaciones de seguridad
-            const isWhitelisted = await getWhatsappWhitelist(numberPhone)
-            defaultLogger.info('Verificación de whitelist', {
-                userId,
-                numberPhone,
-                name,
-                isWhitelisted,
-                action: 'whitelist_verification',
-                file: 'voice.js'
-            })
-
-            if (isWhitelisted) {
-                defaultLogger.info('Usuario en whitelist, finalizando flujo', {
-                    userId,
-                    numberPhone,
-                    name,
-                    action: 'whitelist_end_flow',
-                    file: 'voice.js'
-                })
-                return endFlow()
+            const stopPresenceSafe = async () => {
+                try { await new Promise(resolve => setTimeout(resolve, 5000)) } catch (_) {}
+                try { await presence.stop() } catch (_) {}
             }
 
-            const botStatus = await whatsappStatus()
-            defaultLogger.info('Estado global del bot', {
-                userId,
-                numberPhone,
-                name,
-                botStatus,
-                action: 'global_status_check',
+            defaultLogger.info('Iniciando etapa de transcripción y respuesta (audio - único addAction)', {
+                userId, numberPhone, name, profilePictureUrl,
+                action: 'audio_response_stage_start',
                 file: 'voice.js'
             })
 
-            if (botStatus && !botStatus.status) {
-                defaultLogger.info('Bot desactivado globalmente', {
-                    action: 'global_status_end_flow',
-                    file: 'voice.js'
-                })
-                return endFlow()
-            }
-
-            const userStatus = await getWhatsapp(numberPhone)
-            defaultLogger.info('Estado del usuario', {
-                userId,
-                numberPhone,
-                name,
-                userStatus,
-                action: 'user_status_check',
-                file: 'voice.js'
-            })
-
-             // Actualizar estado del usuario si es nuevo
-             if (!userStatus) {
-                const newUserStatus = await putWhatsapp(numberPhone, name, true)
-                defaultLogger.info('Nuevo usuario registrado', {
-                    userId,
-                    numberPhone,
-                    name,
-                    newUserStatus,
-                    action: 'new_user_registration',
-                    file: 'voice.js'
-                })
-            }
-
-            if (userStatus && !userStatus.status) {
-                defaultLogger.info('Usuario desactivado', {
-                    userId,
-                    numberPhone,
-                    name,
-                    action: 'user_disabled_end_flow',
-                    file: 'voice.js'
-                })
-                return endFlow()
-            }
-
-            // Convertir audio a texto
-            const transcribedText = await handlerAI(ctx,provider, numberPhone)
+            // ===== CONVERTIR AUDIO A TEXTO =====
+            const transcribedText = await handlerAI(ctx, provider, numberPhone)
             defaultLogger.info('Audio transcrito', {
-                userId,
-                numberPhone,
-                name,
-                transcribedText,
+                userId, numberPhone, name, transcribedText,
                 action: 'audio_transcription',
                 file: 'voice.js'
             })
-
-            if(transcribedText === "ERROR"){
-                await provider.sendMessage(numberPhone,"Disculpa, no entendí tu mensaje. Por favor, puedes enviarlo de nuevo.", { media: null})
+            if (transcribedText === "ERROR") {
+                await provider.sendMessage(numberPhone, "Disculpa, no entendí tu mensaje. Por favor, puedes enviarlo de nuevo.", { media: null })
+                await stopPresenceSafe()
                 return endFlow()
             }
 
-            // Call the alarm processing method
-            const shouldEndFlow = await processAlarm(ctx, numberPhone, name, provider, transcribedText,transcribedText,"user")
-            if (shouldEndFlow) return endFlow()
-
-            // Actualizar historial de conversación
-            const newHistory = state.getMyState()?.history ?? []
-            newHistory.push({
-                role: 'user',
-                content: transcribedText
-            })
-
-            defaultLogger.info('Procesando mensajes acumulados', {
-                userId,
-                numberPhone,
-                name,
-                transcribedText,
-                history: newHistory,
-                action: 'processing_messages',
-                file: 'voice.js'
-            })
-
-            // Obtener respuesta del modelo
-            const response = await run(name, newHistory, transcribedText, numberPhone)
-            defaultLogger.info('Respuesta del modelo obtenida', {
-                userId,
-                numberPhone,
-                name,
-                modelResponse: response,
-                action: 'model_response',
-                file: 'voice.js'
-            })
-
-            // Call the alarm processing method
-            const shouldEndFlow2 = await processAlarm(ctx, numberPhone, name, provider, response,transcribedText,"IA")
-            if (shouldEndFlow2) return endFlow()
-
-            // Procesar orden si se detecta
-            if (response.toLowerCase().includes("datos recibidos")) {
-
-                const whatsappPrompt = await promptGetWhatsapp(transcribedText);
-                if(whatsappPrompt.products_dynamic){
-                        const updatePrompt = await runUpdatePromptServicesProduct(response);
-                        defaultLogger.info('Prompt actualizado', {
-                            userId,
-                            numberPhone,
-                            name,
-                            updatePrompt,
-                            action: 'update_prompt_complete',
-                            file: 'voice.js'
-                        });
-
-                        const responseUpdateProductWhatsapp = await promptUpdateProductWhatsapp(updatePrompt);
-                        defaultLogger.info('Respuesta de actualización de producto prompt', {
-                            userId,
-                            numberPhone,
-                            name,
-                            responseUpdateProductWhatsapp,
-                            action: 'product_update_response',
-                            file: 'voice.js'
-                        });
+            // ================ COORDINACIÓN COMPARTIDA: MARCAR AUDIO READY ================
+            // Re-leer entryId desde state (última fuente verdad) o fallback consumeLatestPendingOfType.
+            const myState = state.getMyState() || {}
+            let flowVersion = Number(myState.conversationVersion || myVersion || 0)
+            let myEntryId = myState.conversationEntryId || null
+            if (!myEntryId || flowVersion > 0) {
+                const fallbackAudio = consumeLatestPendingOfType(numberPhone, 'audio')
+                if (fallbackAudio && fallbackAudio.entryId) {
+                    if (!myEntryId) myEntryId = fallbackAudio.entryId
+                    pendingAudio = fallbackAudio  // actualizar por si la primera llamada (arriba) cogió uno antiguo
                 }
-
-                const orderConfirmation = await putWhatsappOrderConfirmation(name, numberPhone, response, "pending_payment")
-                defaultLogger.info('Orden procesada', {
-                    userId,
-                    numberPhone,
-                    name,
-                    response,
-                    orderConfirmation,
-                    action: 'order_processing',
+            }
+            defaultLogger.info('Voz marcar READY audio transcrito', {
+                userId, numberPhone, name,
+                flowVersion, myEntryId,
+                storedVersion: myState.conversationVersion,
+                storedEntryId: myState.conversationEntryId,
+                pendingAudioEntryId: pendingAudio ? pendingAudio.entryId : null,
+                action: 'conversation_voice_ready',
+                file: 'voice.js'
+            })
+            if (flowVersion > 0 && myEntryId) {
+                markMessageReady(numberPhone, myEntryId, {
+                    content: transcribedText,
                     file: 'voice.js'
                 })
             }
-            
-            // Enviar respuesta en chunks para mejor legibilidad
-            //const chunks = response.split(/(?<!\d)\.(?=\s|$)|:\n\n/g)
-            const chunks = response.split(/:\n\n|\n\n/)
+            // ==========================================================
 
-            for (const chunk of chunks) {
-                await provider.sendMessage(numberPhone,chunk.replace(/^[\n]+/, '').trim(), { media: null})
-                await setTimeout(2000)
+            // Alarma user-side
+            const shouldEndFlow = await processAlarm(ctx, numberPhone, name, provider, transcribedText, transcribedText, "user")
+            if (shouldEndFlow) {
+                await stopPresenceSafe()
+                return endFlow()
             }
 
-            // Actualizar historial con respuesta
-            newHistory.push({
-                role: 'assistant',
-                content: response
+            // ============================================================
+            // GUARD DE RÁFAGA VIVA (evita respuestas duplicadas en audio).
+            // REGLA NEGOCIO: imagen -> texto/audio DENTRO 45s debe generar
+            // 1 SOLA RESPUESTA UNIFICADA, no 2 separadas.
+            // ============================================================
+            if (Number(flowVersion || 0) <= 0) {
+                const rafagaInfo = isRafagaVivaActive(numberPhone, { file: 'voice.js' })
+                if (rafagaInfo && rafagaInfo.active) {
+                    // Forzamos camino coordinado.
+                    const newFlowVer = Number(getCurrentVersion(numberPhone) || 1) || 1
+                    defaultLogger.info('Voice audio: ráfaga viva detectada. Forzando camino coordinado (no legacy) para unificar en 1 respuesta.', {
+                        userId, numberPhone, name,
+                        newCoordinatedVersion: newFlowVer,
+                        rafagaDetail: {
+                            bufferCount: rafagaInfo.bufferCount,
+                            uniqueTypes: rafagaInfo.uniqueTypes,
+                            sinceLastMs: rafagaInfo.sinceLastMs
+                        },
+                        action: 'voice_rafaga_viva_force_coordinated_path',
+                        file: 'voice.js'
+                    })
+                    flowVersion = newFlowVer
+                }
+            }
+
+            if (Number(flowVersion || 0) <= 0) {
+                // ====== CAMINO LEGACY (sin coordinación compartida) =====
+                const greetingResetHere = isGreetingResetTrigger(transcribedText)
+                const newHistory = greetingResetHere ? [] : (state.getMyState()?.history ?? []).slice()
+                if (greetingResetHere) {
+                    await state.update({ history: [] })
+                    defaultLogger.info('Saludo detectado en audio → RESET historial (legacy audio)', {
+                        userId, numberPhone, name, transcribedText,
+                        action: 'history_greeting_reset_legacy',
+                        file: 'voice.js'
+                    })
+                }
+                newHistory.push({ role: 'user', content: transcribedText })
+                defaultLogger.info('Procesando mensajes acumulados (legacy audio)', {
+                    userId, numberPhone, name, transcribedText,
+                    history: newHistory, action: 'processing_messages_legacy', file: 'voice.js'
+                })
+            const response = await run(name, newHistory, transcribedText, numberPhone)
+                defaultLogger.info('Respuesta del modelo obtenida (legacy audio). FLUJO COMPROMETIDO: NO INVALIDAR POR NADA', {
+                    userId, numberPhone, name, modelResponse: response,
+                    action: 'model_response',
+                    note: 'DESPUÉS DE ESTE PUNTO, SIN 2ª VALIDACIÓN, SE RESPONDE OBLIGATORIAMENTE',
+                    file: 'voice.js'
+                })
+                // ✅ MARCAR LEÍDO SÓLO AQUÍ (después de run, antes de enviar respuesta)
+                try { await provider.vendor.readMessages([ctx.key]) } catch (_) {}
+                await respondAndFinalize(response, transcribedText, name, numberPhone, userId, ctx, provider, flowDynamic, state)
+                await stopPresenceSafe()
+                return null
+            }
+
+            // ====== CAMINO COORDINADO ======
+            // Esperar turno (25s silencio + todos listos + yo soy última versión)
+            const turn = await waitForTurn(numberPhone, {
+                flowVersion,
+                flowType: 'audio',
+                flowId: `audio_${myEntryId || ''}`,
+                file: 'voice.js'
+            })
+            if (!turn.acquired) {
+                defaultLogger.info('Flujo audio cede turno (invalidado)', {
+                    userId, numberPhone, name,
+                    flowVersion,
+                    finalVersion: turn.finalVersion,
+                    cancelReason: turn.cancelReason,
+                    action: 'conversation_audio_cede',
+                    file: 'voice.js'
+                })
+                await stopPresenceSafe()
+                return endFlow()
+            }
+
+            const combinedInput = turn.combinedInput || transcribedText
+
+            const greetingResetHere = isGreetingResetTrigger(combinedInput)
+            const newHistory = greetingResetHere ? [] : (state.getMyState()?.history ?? []).slice()
+            if (greetingResetHere) {
+                await state.update({ history: [] })
+                defaultLogger.info('Saludo detectado en audio → RESET historial (coordinado audio)', {
+                    userId, numberPhone, name, combinedInput,
+                    action: 'history_greeting_reset_coordinated',
+                    file: 'voice.js'
+                })
+            }
+            newHistory.push({ role: 'user', content: combinedInput })
+
+            defaultLogger.info('Procesando mensajes acumulados (coordinación audio)', {
+                userId, numberPhone, name,
+                flowVersion,
+                combinedInput,
+                combinedLength: String(combinedInput).length,
+                historyLength: newHistory.length,
+                action: 'processing_messages_shared_audio',
+                file: 'voice.js'
             })
 
-            // Eliminar los primeros 2 elementos
-            // Comprobar si el array tiene más de 20 elementos
-            if (newHistory.length > 20) {
-                // Eliminar los primeros 2 elementos si tiene más de 20 elementos
-                newHistory.splice(0, 2);
-            }
+            defaultLogger.info('Inicio consulta IA (audio, coordinado)', {
+                userId, numberPhone, name,
+                flowVersion,
+                combinedLength: String(combinedInput).length,
+                action: 'conversation_ai_request_start',
+                file: 'voice.js'
+            })
+            const response = await run(name, newHistory, combinedInput, numberPhone)
+            defaultLogger.info('Respuesta del modelo obtenida (audio, coordinado). FLUJO COMPROMETIDO: NO INVALIDAR POR NADA, RESPONDER SIEMPRE', {
+                userId, numberPhone, name,
+                flowVersion,
+                modelResponse: response,
+                action: 'conversation_ai_response_done',
+                note: 'DESPUÉS DE ESTE PUNTO, SIN 2ª VALIDACIÓN, SE RESPONDE OBLIGATORIAMENTE',
+                file: 'voice.js'
+            })
 
-            await state.update({ history: newHistory })
+            // ✅ REGLA DE NEGOCIO: no hay 2ª validación isStillMyTurn aquí.
+            //    Si llegamos hasta aquí con respuesta IA, se envía sí o sí.
 
-           
+            // ✅ MARCAR LEÍDO SÓLO AQUÍ (después de run, antes de enviar respuesta)
+            try { await provider.vendor.readMessages([ctx.key]) } catch (_) {}
+
+            // 🔴 Limpiar con la versión REAL adquirida (turn.finalVersion), no con la
+            // de nacimiento del flujo: así no se "preservan" mensajes ya respondidos
+            // cuando el usuario envió varios mensajes por separado.
+            await respondAndFinalize(response, combinedInput, name, numberPhone, userId, ctx, provider, flowDynamic, state, turn.finalVersion)
+            await stopPresenceSafe()
 
         } catch (error) {
-            defaultLogger.error('Error en segunda acción de voz', {
-                userId: extractUserId(ctx),
-                numberPhone: extractNumber(ctx),
-                name: extractName(ctx),
+            defaultLogger.error('Error en flujo audio (único addAction)', {
+                userId, numberPhone, name,
                 error: error.message,
                 stack: error.stack,
                 context: ctx,
                 file: 'voice.js'
             })
             return endFlow()
-        }finally{
-            await markMessageSeen(provider, ctx)
+        } finally {
+            if (presence) await presence.stop()
+            try {
+                // Parada defensiva (siempre paused). El stopPresenceSafe con
+                // sleep+stop ya fue llamado en las ramas exitosas; aquí enviamos
+                // una orden rápida sin esperar 5s para no bloquear finally.
+                if (provider?.vendor?.sendPresenceUpdate && ctx?.key?.remoteJid) {
+                    try { await provider.vendor.sendPresenceUpdate('paused', ctx.key.remoteJid) } catch (_) {}
+                }
+            } catch (_) { /* no-op */ }
         }
+    }
+
+
+const respondAndFinalize = async (response, combinedMessages, name, numberPhone, userId, ctx, provider, flowDynamic, state, flowVersion) => {
+    const st = state.getMyState() || {}
+    const newHistory = (st.history ?? []).slice()
+
+    // Duplicado IA
+    if (newHistory.length >= 2 &&
+        newHistory[newHistory.length - 2].role === 'assistant' &&
+        newHistory[newHistory.length - 2].content === response) {
+        defaultLogger.info('Mensaje duplicado OpenIA (voice), ignorando...', {
+            userId, numberPhone, name,
+            action: 'duplicate_message_openia',
+            file: 'voice.js'
+        })
+        return { duplicated: true }
+    }
+
+    // Procesar orden "datos recibidos"
+    if (response.toLowerCase().includes("datos recibidos")) {
+        const whatsappPrompt = await promptGetWhatsapp(combinedMessages);
+        if (whatsappPrompt.products_dynamic) {
+            const updatePrompt = await runUpdatePromptServicesProduct(response);
+            defaultLogger.info('Prompt actualizado (voice)', {
+                userId, numberPhone, name, updatePrompt,
+                action: 'update_prompt_complete', file: 'voice.js'
+            });
+            const responseUpdateProductWhatsapp = await promptUpdateProductWhatsapp(updatePrompt);
+            defaultLogger.info('Respuesta de actualización de producto prompt (voice)', {
+                userId, numberPhone, name, responseUpdateProductWhatsapp,
+                action: 'product_update_response', file: 'voice.js'
+            });
+        }
+        const orderConfirmation = await putWhatsappOrderConfirmation(name, numberPhone, response, "pending_payment")
+        defaultLogger.info('Orden procesada (voice)', {
+            userId, numberPhone, name, response, orderConfirmation,
+            action: 'order_processing', file: 'voice.js'
+        })
+        await putWhatsapp(numberPhone, name, false)
+
+    } else {
+        // Alarm IA
+        const shouldEndFlow = await processAlarm(ctx, numberPhone, name, provider, response, combinedMessages, "IA")
+        if (shouldEndFlow) return { alarm: true }
+    }
+
+    defaultLogger.info('Enviando respuesta final al usuario (voice)', {
+        numberPhone, userId,
+        responseLength: String(response).length,
+        flowVersion: flowVersion !== undefined ? flowVersion : 'legacy',
+        responsePreview: String(response).slice(0, 200),
+        action: flowVersion !== undefined ? 'conversation_audio_response_sending' : 'response_sending',
+        file: 'voice.js'
     })
 
+    if (numberPhone.length <= 11) {
+        await provider.sendMessage(numberPhone, response, { media: null })
+    } else {
+        await flowDynamic(response)
+    }
+
+    if (newHistory.length === 0 || newHistory[newHistory.length - 1].role !== 'user' || newHistory[newHistory.length - 1].content !== combinedMessages) {
+        newHistory.push({ role: 'user', content: combinedMessages })
+    }
+    newHistory.push({ role: 'assistant', content: response })
+    if (newHistory.length > 20) newHistory.splice(0, 2)
+    await state.update({ history: newHistory })
+
+    if (flowVersion !== undefined) {
+        clearConversationAfterResponse(numberPhone, {
+            finalVersion: flowVersion,
+            file: 'voice.js'
+        })
+    }
+
+    defaultLogger.info('Respuesta enviada correctamente (voice)', {
+        numberPhone, userId,
+        flowVersion: flowVersion !== undefined ? flowVersion : 'legacy',
+        historyLength: newHistory.length,
+        action: flowVersion !== undefined ? 'conversation_audio_response_sent' : 'response_sent',
+        file: 'voice.js'
+    })
+    return { ok: true }
+}
 
     // Process alarms through dedicated method
 const processAlarm = async (ctx, numberPhone, name, provider, question,message,UserOrIA) => {
     const hasAlarm = await regexAlarm(question)
     defaultLogger.info('Verificación de alarma', {
-        userId: extractUserId(ctx),
+        userId: ctx.key.remoteJid,
         numberPhone,
         name,
         messageBody: question,
@@ -444,10 +640,10 @@ const processAlarm = async (ctx, numberPhone, name, provider, question,message,U
 
         const messageFlow = UserOrIA === "user" ? "Gracias por tu mensaje. En breve nos pondremos en contacto contigo." : question
 
-        await provider.sendMessage(numberPhone,alarmResponse 
+        await provider.sendMessage(numberPhone,alarmResponse
             ? messageFlow
             : "Lo sentimos, pero no tenemos personal disponible en este momento.", { media: null})
-        
+
         await putWhatsapp(numberPhone, name, false)
         return true
     }

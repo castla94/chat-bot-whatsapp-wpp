@@ -1,5 +1,4 @@
-import { addKeyword, EVENTS } from '@builderbot/bot';
-import { run } from '../services/openai/index.js';
+import { run, runUpdatePromptServicesProduct } from '../services/openai/index.js';
 import {
     getWhatsappConversation,
     putWhatsappEmailVendor,
@@ -9,15 +8,29 @@ import {
     getWhatsappPlanPremiun,
     putWhatsapp,
     regexAlarm,
-    postWhatsappConversation
+    postWhatsappConversation,
+    putWhatsappOrderConfirmation,
+    promptUpdateProductWhatsapp,
+    promptGetWhatsapp
 } from '../services/aws/index.js';
 import fs from "fs";
-import { join } from 'path';
 import { defaultLogger } from '../helpers/cloudWatchLogger.js';
 import { processImage } from "../services/image/index.js";
-import { extractName, extractNumber, extractUserId, markMessageSeen, resolveNumber } from './providerContext.js';
-
-const MEDIA_DIR = join(new URL('..', import.meta.url).pathname, 'media');
+import { getProfilePictureInfo } from '../helpers/whatsappProfile.js';
+import {
+    markMessageReady,
+    waitForTurn,
+    isStillMyTurn,
+    clearConversationAfterResponse,
+    getConversationState,
+    getCurrentVersion,
+    consumeLatestPendingOfType,
+    waitForMyMessageEntryInBuffer,
+    isRafagaVivaActive,
+    bumpConversationVersion,
+    registerSyntheticMessage,
+    isGreetingResetTrigger
+} from '../helpers/conversationBuffer.js';
 
 
 /**
@@ -26,6 +39,268 @@ const MEDIA_DIR = join(new URL('..', import.meta.url).pathname, 'media');
  * @returns {Promise} Promesa que se resuelve después del tiempo especificado
  */
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+// ============================================================
+// KEEP-ALIVE DE PRESENCIA ("escribiendo…")
+// ============================================================
+// WhatsApp Baileys borra el estado "composing" tras ~15s de inactividad.
+// Refrescamos cada PRESENCE_REFRESH_MS hasta stop().
+// ============================================================
+const PRESENCE_REFRESH_MS = 10 * 1000
+const startPresenceKeepAlive = (provider, jid, { presenceType = 'composing', file = 'media.js' } = {}) => {
+    let stopped = false
+    let refreshTimer = null
+    const fireAndForgetSend = () => {
+        if (stopped || !provider || !provider?.vendor?.sendPresenceUpdate || !jid) return
+        ;(async () => {
+            try {
+                await provider.vendor.sendPresenceUpdate(presenceType, jid)
+                defaultLogger.debug('Presence keep-alive reenviado (media flow)', {
+                    jid, presenceType,
+                    action: 'presence_keepalive_refresh',
+                    file
+                })
+            } catch (e) {
+                defaultLogger.debug('Presence keep-alive error silencioso (media flow)', {
+                    jid, presenceType,
+                    error: e?.message || String(e),
+                    action: 'presence_keepalive_error_swallowed',
+                    file
+                })
+            }
+        })()
+    }
+    fireAndForgetSend()
+    refreshTimer = setInterval(fireAndForgetSend, PRESENCE_REFRESH_MS)
+    const stop = async () => {
+        if (stopped) return
+        stopped = true
+        if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null }
+        try {
+            if (provider?.vendor?.sendPresenceUpdate && jid) {
+                await provider.vendor.sendPresenceUpdate('paused', jid)
+                defaultLogger.debug('Presence keep-alive detenido → paused (media flow)', {
+                    jid, presenceType,
+                    action: 'presence_keepalive_stopped',
+                    file
+                })
+            }
+        } catch (_) {}
+    }
+    return { stop }
+}
+
+// ============================================================
+// MENSAJE GENÉRICO FIJO: cuando NO se puede descargar/procesar imagen.
+// Texto EXACTO requerido por negocio:
+//   "Disculpa, no logré descargar la imagen 😔. ¿Puedes enviármela nuevamente?"
+// ============================================================
+const IMAGE_DOWNLOAD_ERROR_MSG = 'Disculpa, no logré descargar la imagen 😔. ¿Puedes enviármela nuevamente?'
+
+// ============================================================
+// VIDEO: cuando el usuario manda un video NO lo procesamos.
+// Se envía como PREGUNTA a la IA para que se derive a un asesor.
+// ============================================================
+const VIDEO_ADVISOR_QUESTION = 'El usuario mandó un video, así que llama a un asesor.'
+
+const isVideoMessageCtx = (ctx) => Boolean(
+    ctx?.message?.videoMessage ||
+    ctx?.msg?.message?.videoMessage ||
+    ctx?.msg?.videoMessage
+)
+
+// ============================================================
+// Helper: ¿está PERMITIDO responder a este número?
+// false si: número en whitelist, bot desactivado globalmente,
+// o contacto desactivado.
+// Se usa en el catch para NO responder si el error ocurrió ANTES
+// de las validaciones (p. ej. al obtener la foto de perfil).
+// Ante error/duda en la verificación → false (no responder).
+// ============================================================
+const isReplyAllowedForNumber = async (numberPhone, { name = '', file = 'media.js' } = {}) => {
+    try {
+        const isWhitelisted = await getWhatsappWhitelist(numberPhone)
+        if (isWhitelisted) return false
+
+        const botStatus = await whatsappStatus()
+        if (botStatus && !botStatus.status) return false
+
+        const userStatus = await getWhatsapp(numberPhone, { name, profilePictureUrl: null })
+        if (userStatus && !userStatus.status) return false
+
+        return true
+    } catch (e) {
+        defaultLogger.warn('isReplyAllowedForNumber: no se pudo verificar estado → se asume NO responder', {
+            numberPhone, name,
+            error: e?.message || String(e),
+            action: 'media_reply_allowed_check_error',
+            file
+        })
+        return false
+    }
+}
+
+// ============================================================
+// Helper: ENVÍA SEGURO (chunks, numberPhone largo gswa usa flowDynamic).
+// ============================================================
+const sendReplySafe = async (numberPhone, provider, flowDynamic, text) => {
+    try {
+        if (!text || !String(text).trim()) return
+        if (String(numberPhone || '').length <= 11) {
+            await provider.sendMessage(numberPhone, text, { media: null })
+        } else {
+            await flowDynamic(text)
+        }
+    } catch (err) {
+        defaultLogger.debug('sendReplySafe error silencioso', {
+            numberPhone, length: String(text || '').length,
+            error: err?.message || String(err),
+            action: 'image_send_reply_safe_swallowed', file: 'media.js'
+        })
+    }
+}
+
+// ============================================================
+// Helper: procesar caption solo como TEXTO (sin imagen).
+// Usado cuando:
+//   - imagen throttled PERO tiene caption (NO SILENCIAR caption).
+//   - imagen no se pudo descargar Y tiene caption.
+//   - imagen corrupta Y tiene caption.
+//
+// Flujo interno:
+//   1. Cargar historial (igual que chatbot).
+//   2. Lanzar run(caption).
+//   3. Enviar respuesta + actualizar historial + limpiar presence safe.
+//
+// Nota: NO toca waitForTurn/coordinación. Va por LEGACY directo (como
+// chatbot fallback myVersion<=0). Así no espera polling innecesario.
+// El usuario SIEMPRE recibe respuesta a su caption.
+// Retorna: listo para hacer return endFlow() desde afuera.
+// ============================================================
+const runCaptionOnlyAsText = async ({
+    captionRaw, ctx, numberPhone, userId, name, provider, flowDynamic, state,
+    presence, userContent: userContentOverride
+}) => {
+    const caption = String(captionRaw || '').trim()
+    if (!caption) {
+        defaultLogger.debug('runCaptionOnlyAsText llamado sin caption. No-op.', {
+            userId, numberPhone,
+            action: 'image_caption_only_empty_skip', file: 'media.js'
+        })
+        return
+    }
+    defaultLogger.info('Imagen omitida → procesando caption como TEXTO puro (LEGACY directo).', {
+        userId, numberPhone, name,
+        captionLength: caption.length,
+        captionPreview: caption.slice(0, 120),
+        action: 'image_caption_only_run_start',
+        file: 'media.js'
+    })
+    // Presence keep-alive si existe el objeto (los caminos de saveFile / throttle
+    // post-L418 ya lo crearon; el camino throttle temprano no lo tiene).
+    if (!presence) {
+        try {
+            if (provider?.vendor?.sendPresenceUpdate && ctx?.key?.remoteJid) {
+                await provider.vendor.sendPresenceUpdate('composing', ctx.key.remoteJid).catch(() => {})
+            }
+        } catch (_) {}
+    }
+    const stopPresenceSafeCaption = async () => {
+        try { await new Promise(resolve => setTimeout(resolve, 3000)) } catch (_) {}
+        try {
+            if (presence && typeof presence.stop === 'function') await presence.stop().catch(() => {})
+            else if (provider?.vendor?.sendPresenceUpdate && ctx?.key?.remoteJid) {
+                await provider.vendor.sendPresenceUpdate('paused', ctx.key.remoteJid).catch(() => {})
+            }
+        } catch (_) {}
+    }
+    try {
+        // Pre-cargar historial igual que chatbot/legacy.
+        const stBefore = state.getMyState() || {}
+        const historyBefore = Array.isArray(stBefore.history) ? stBefore.history.slice() : []
+        let historyForRun = historyBefore
+        const greetingResetCaption = isGreetingResetTrigger(caption)
+        if (greetingResetCaption) {
+            historyForRun = []
+            await state.update({ ...stBefore, history: [] }).catch(() => {})
+            defaultLogger.info('Caption-only: saludo detectado → RESET historial', {
+                userId, numberPhone, name, caption,
+                action: 'image_caption_only_greeting_reset', file: 'media.js'
+            })
+        } else if (historyForRun.length === 0) {
+            try {
+                const dbHistory = await getWhatsappConversation(numberPhone)
+                if (Array.isArray(dbHistory) && dbHistory.length > 0) {
+                    historyForRun = dbHistory.slice()
+                    await state.update({ ...stBefore, history: historyForRun }).catch(() => {})
+                    defaultLogger.info('Caption-only: historial cargado desde DB', {
+                        userId, numberPhone, name, len: historyForRun.length,
+                        action: 'image_caption_only_history_loaded', file: 'media.js'
+                    })
+                }
+            } catch (_dbErr) { /* no-op: usar [] */ }
+        }
+        const userContent = String(userContentOverride || `El usuario envió una imagen que no fue procesada. Su texto (caption) es: "${caption}". Responde directamente a este texto como si fuera un mensaje normal.`)
+        const newHistory = historyForRun.slice()
+        newHistory.push({ role: 'user', content: userContent })
+        defaultLogger.info('Caption-only: inicio llamada IA run(caption)', {
+            userId, numberPhone, name,
+            historyLength: newHistory.length,
+            action: 'image_caption_only_ia_start',
+            file: 'media.js'
+        })
+        const response = await run(name, newHistory, userContent, numberPhone, null)
+        defaultLogger.info('Caption-only: Respuesta del modelo obtenida. ENVIAR SIN INVALIDAR.', {
+            userId, numberPhone, name,
+            modelResponseLen: String(response || '').length,
+            action: 'image_caption_only_model_response',
+            file: 'media.js'
+        })
+
+        // Marcar leído (solo aquí, cuando está confirmada la respuesta IA).
+        try { if (ctx && ctx.key) await provider.vendor.readMessages([ctx.key]).catch(() => {}) } catch (_) {}
+
+        // Enviar respuesta + guardar en historial + alarma IA.
+        const alarmResp = await processAlarm(ctx, numberPhone, name, provider, response, "IA")
+            .catch(() => false)
+        if (alarmResp) {
+            await stopPresenceSafeCaption()
+            return
+        }
+        await sendReplySafe(numberPhone, provider, flowDynamic, response)
+        const finalHistory = newHistory.slice()
+        finalHistory.push({ role: 'assistant', content: String(response || '') })
+        if (finalHistory.length > 20) finalHistory.splice(0, 2)
+        await state.update({ history: finalHistory }).catch(() => {})
+        try {
+            await postWhatsappConversation(numberPhone, [
+                { role: 'user', content: caption, role_type: 'user' },
+                { role: 'assistant', content: String(response || ''), role_type: 'assistant' }
+            ]).catch(() => {})
+        } catch (_) {}
+        defaultLogger.info('Caption-only: respuesta enviada y limpio terminado.', {
+            userId, numberPhone, name,
+            responseLen: String(response || '').length,
+            action: 'image_caption_only_done',
+            file: 'media.js'
+        })
+    } catch (errCaption) {
+        defaultLogger.error('Caption-only: error interno. Enviar fallback simple.', {
+            userId, numberPhone, name,
+            captionPreview: caption.slice(0, 120),
+            error: errCaption?.message || String(errCaption),
+            stack: errCaption?.stack || null,
+            action: 'image_caption_only_runtime_error',
+            file: 'media.js'
+        })
+        // Fallback simple: no dejar al usuario en SILENCIO TOTAL.
+        const simpleFallback = 'Vi tu mensaje pero no pude generar respuesta en este momento 😔. Inténtalo en instantes o describe en texto lo que necesites.'
+        try { if (ctx && ctx.key) await provider.vendor.readMessages([ctx.key]).catch(() => {}) } catch (_) {}
+        await sendReplySafe(numberPhone, provider, flowDynamic, simpleFallback)
+    } finally {
+        await stopPresenceSafeCaption()
+    }
+}
 
 
 // Function to check premium plan status
@@ -47,7 +322,7 @@ const checkPremiumPlan = async (userId, numberPhone, name, provider) => {
             action: 'without_plan',
             file: 'media.js'
         })
-    
+
         await provider.sendMessage(numberPhone,"Lo siento, no puedo procesar tu imagen. Por favor, envíame por texto lo que necesitas consultar.", { media: null})
 
         return true
@@ -69,10 +344,10 @@ const checkPremiumPlan = async (userId, numberPhone, name, provider) => {
 }
 
 // Process alarms through dedicated method
-const processAlarm = async (ctx, numberPhone, name, question) => {
+const processAlarm = async (ctx, numberPhone, name, provider, question, UserOrIA ) => {
     const hasAlarm = await regexAlarm(question)
     defaultLogger.info('Verificación de alarma', {
-        userId: extractUserId(ctx),
+        userId: ctx.key.remoteJid,
         numberPhone,
         name,
         messageBody: question,
@@ -83,7 +358,7 @@ const processAlarm = async (ctx, numberPhone, name, question) => {
 
     if (hasAlarm) {
         defaultLogger.info('Alarma encontrada, finalizando flujo', {
-            userId: extractUserId(ctx),
+            userId: ctx.key.remoteJid,
             numberPhone,
             name,
             hasAlarm,
@@ -91,31 +366,99 @@ const processAlarm = async (ctx, numberPhone, name, question) => {
             action: 'alarm_found',
             file: 'media.js'
         })
+
+        const alarmResponse = await putWhatsappEmailVendor(numberPhone, name, question)
+        defaultLogger.info('Procesamiento de alarma (media/img)', {
+            numberPhone,
+            name,
+            message: question,
+            alarmResponse,
+            action: 'alarm_processing',
+            file: 'media.js'
+        })
+
+        const message = UserOrIA === "user" ? "Gracias por tu mensaje. En breve nos pondremos en contacto contigo." : question
+
+        const responseMessage = alarmResponse
+            ? message
+            : "Lo sentimos, pero no tenemos personal disponible en este momento."
+
+        await provider.sendMessage(numberPhone, responseMessage, { media: null })
+
         await putWhatsapp(numberPhone, name, false)
         return true
     }
     return false
 }
 
+
+function extractNumber(ctx) {
+    try {
+        // El adaptador WPPConnect resuelve LID y entrega el teléfono real.
+        if (!ctx.from) throw new Error('No se pudo resolver el teléfono del contacto')
+        return ctx.from
+    } catch (error) {
+        defaultLogger.error('Error extrayendo número', {
+            error: error.message, stack: error.stack, context: ctx,
+            action: 'extract_number_error', file: 'chatbot.js'
+        })
+        return ctx.from
+    }
+}
+
 function extractMediaCaption(ctx) {
+    // ============================================================
+    // NOTA IMPORTANTE sobre orden de candidatos:
+    // En BuilderBot EVENTS.MEDIA, ctx.body NO es el caption; contiene
+    // el nombre del evento interno tipo "_event_media__UUID". Si lo
+    // ponemos primero, captura MAL el texto como nombre del evento.
+    //
+    // Orden CORRECTO (de más específico a más genérico):
+    //   1. imageMessage.caption / videoMessage.caption / documentMessage.caption
+    //      (estos provienen DIRECTAMENTE de WhatsApp/Baileys y son el
+    //      caption real del usuario que acompañó al medio enviado).
+    //   2. ctx.caption / ctx.msg.caption (BuilderBot alias conveniente,
+    //      cuando existe es el caption extraído).
+    //   3. extendedTextMessage.text (cuando el media trae texto extra
+    //      embeddeado; caso poco común pero posible).
+    //   4. ctx.body / ctx.msg.body (ÚLTIMO. Solo usar si no hubo nada
+    //      más y no se trata de un nombre de evento UUID).
+    // ============================================================
     const candidates = [
-        ctx?.body,
-        ctx?.caption,
         ctx?.message?.imageMessage?.caption,
-        ctx?.message?.videoMessage?.caption,
-        ctx?.message?.extendedTextMessage?.text,
-        ctx?.msg?.caption,
-        ctx?.msg?.body,
-        ctx?.msg?.imageMessage?.caption,
         ctx?.msg?.message?.imageMessage?.caption,
-        ctx?.message?.documentMessage?.caption
+        ctx?.msg?.imageMessage?.caption,
+        ctx?.message?.videoMessage?.caption,
+        ctx?.msg?.message?.videoMessage?.caption,
+        ctx?.msg?.videoMessage?.caption,
+        ctx?.message?.documentMessage?.caption,
+        ctx?.msg?.message?.documentMessage?.caption,
+        ctx?.msg?.documentMessage?.caption,
+        ctx?.caption,
+        ctx?.msg?.caption,
+        ctx?.message?.extendedTextMessage?.text,
+        ctx?.msg?.extendedTextMessage?.text,
+        ctx?.msg?.message?.extendedTextMessage?.text,
+        ctx?.body,
+        ctx?.msg?.body
     ];
 
     for (const candidate of candidates) {
         const value = String(candidate || '').trim();
-        if (value) {
-            return value;
+        if (!value) continue;
+        // Protección anti-nombre-de-evento BuilderBot: CUALQUIER string que
+        // empiece por "_event_" se considera nombre interno del evento
+        // (p. ej. "_event_media__UUID", "_event_voice__xxx",
+        //  "_event_document__corto", etc.). NUNCA se toma como caption.
+        if (value.startsWith('_event_')) {
+            continue;
         }
+        // Segunda capa defensiva: match exacto de UUID completo con guiones
+        // por si alguien cambiara el prefijo.
+        if (/^_event_[a-z0-9]+__[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+            continue;
+        }
+        return value;
     }
 
     return '';
@@ -123,281 +466,824 @@ function extractMediaCaption(ctx) {
 
 /**
  * Flow para manejar eventos de medios (imágenes) enviados por el usuario
- * Procesa comprobantes de pago y notifica al vendedor
+ * Procesa comprobantes de pago y notifica al vendedor.
+ * ESTRUCTURA UNIFICADA igual que chatbot.js/voice.js: 1 solo addAction.
  */
-export const media = addKeyword(EVENTS.MEDIA)
-    .addAction(async (ctx, { flowDynamic, endFlow, state, provider }) => {
-        const userId = extractUserId(ctx)
-        const name = extractName(ctx)
+export const media = async (ctx, { flowDynamic, endFlow, state, provider }) => {
+        let presence = null
+        const userId = ctx.key.remoteJid
+        const numberPhone = extractNumber(ctx)
+        const name = ctx?.pushName ?? ''
         const mediaCaption = extractMediaCaption(ctx)
+        const messageId = ctx?.key?.id || null
+        // SCOPE GENERAL: hasCaptionNow lo usan TODOS los branches de error
+        // (throttle temprano, saveFile, processImage, catch final, etc.)
+        // para NO SILENCIAR al usuario cuando escribió texto con la imagen.
+        const hasCaptionNow = Boolean(mediaCaption && String(mediaCaption).trim())
+
+        // Bandera: se pone false en las ramas de desactivado (whitelist / bot global / contacto).
+        // El catch la usa (y re-verifica) para NO responder si el estado está desactivado.
+        let respondAllowed = true
 
         try {
-            const numberPhone = await resolveNumber(provider, ctx)
-            defaultLogger.info('Iniciando procesamiento de imagen', {
-                userId,
-                numberPhone,
-                name,
-                mediaCaption,
+            defaultLogger.info('Flujo imagen: procesando (sin throttle). Iniciando setup normal.', {
+                userId, numberPhone, name, messageId,
+                hasCaption: hasCaptionNow,
+                mediaCaption: hasCaptionNow ? String(mediaCaption).slice(0, 100) : '',
+                action: 'media_flow_start_no_throttle',
+                file: 'media.js'
+            })
+
+            const { profilePictureUrl } = await getProfilePictureInfo(ctx, provider, {
+                userId, numberPhone, name, file: 'media.js'
+            })
+
+            defaultLogger.info('Iniciando procesamiento de imagen (único addAction)', {
+                userId, numberPhone, name, mediaCaption, profilePictureUrl,
                 action: 'media_received',
                 timestamp: new Date().toISOString(),
                 file: 'media.js'
             })
 
-            // Validar si el usuario está en lista blanca
+            // ================ COORDINACIÓN COMPARTIDA ================
+            // ✅ NUEVA LÓGICA: esperar a que ESTE mensaje esté en el buffer
+            // (por race condition nuestro listener Baileys puede correrse DESPUÉS de BBot).
+            // Cuando encontramos la entry de IMAGEN propia → tomamos entry.version como flowVersion.
+            let {
+                version: myVersion,
+                entryId: myImageEntryId,
+                matchedBy: myMatchType
+            } = await waitForMyMessageEntryInBuffer(numberPhone, {
+                type: 'image',
+                messageId: ctx?.key?.id || null,
+                contentCandidate: String(mediaCaption || ''),
+                file: 'media.js'
+            })
+            // GUARD: timeout sin entry → skip camino coordinado.
+            // Para imagen: si myVersion=0 → no marca imagen pending throttled en buffer,
+            // y guarda archivo igual. Luego entra al legacy (<=0) y responde.
+            if (myMatchType === 'timeout_fallback_global_version' && Number(myVersion || 0) <= 0) {
+                defaultLogger.warn('WaitForMyEntry timeout → camino LEGACY (imagen sin coordinación). Listener Baileys no insertó mensaje en buffer', {
+                    userId, numberPhone, name,
+                    myMatchType,
+                    fallbackVersion: Number(myVersion || 0),
+                    action: 'conversation_flow_skip_coordinated_timeout_myentry',
+                    file: 'media.js'
+                })
+                myVersion = 0
+                if (myImageEntryId) myImageEntryId = null
+            }
+            // ============================================================
+            // GUARD "RESPUESTA FANTASMA": si esta imagen/caption YA fue
+            // respondida (su entry ya fue limpiada), NO responder de nuevo.
+            // ============================================================
+            if (myMatchType === 'already_answered') {
+                defaultLogger.info('Imagen: mensaje YA respondido previamente → flujo termina en silencio (evita respuesta fantasma)', {
+                    userId, numberPhone, name,
+                    messageId: ctx?.key?.id || null,
+                    action: 'conversation_media_already_answered_skip',
+                    file: 'media.js'
+                })
+                return endFlow()
+            }
+            let pendingImage = myImageEntryId ? { entryId: myImageEntryId } : consumeLatestPendingOfType(numberPhone, 'image')
+            const convStateBefore = getConversationState(numberPhone)
+            defaultLogger.info('Conversación compartida (imagen - snapshot después de encontrar mi entry)', {
+                userId, numberPhone, name,
+                phoneKey: convStateBefore.phoneKey,
+                myVersion,
+                myImageEntryId,
+                myMatchType,
+                pendingImageEntryId: pendingImage ? pendingImage.entryId : null,
+                pendingImageMessageId: pendingImage ? pendingImage.messageId : null,
+                pendingImageReceivedAt: pendingImage && pendingImage.receivedAt ? new Date(pendingImage.receivedAt).toISOString() : null,
+                currentVersion: convStateBefore.version,
+                bufferCount: convStateBefore.bufferCount,
+                meaningfulCount: convStateBefore.meaningfulCount,
+                bufferTypes: convStateBefore.bufferTypes,
+                lastActivityAt: convStateBefore.lastActivityAt ? new Date(convStateBefore.lastActivityAt).toISOString() : null,
+                mediaCaption: String(mediaCaption || '').slice(0, 100),
+                action: 'conversation_flow_init_image',
+                file: 'media.js'
+            })
+            await state.update({
+                ...(state.getMyState() || {}),
+                conversationVersion: myVersion,
+                conversationPhoneKey: convStateBefore.phoneKey,
+                conversationEntryId: pendingImage ? pendingImage.entryId : null
+            })
+            // =========================================================
+
+            // ============ VALIDACIONES (1 SOLA VEZ - igual que chatbot/voice) ============
             const isWhitelisted = await getWhatsappWhitelist(numberPhone)
             defaultLogger.info('Verificación de whitelist', {
-                userId,
-                numberPhone,
-                name,
-                isWhitelisted,
+                userId, numberPhone, name, isWhitelisted,
                 action: 'whitelist_verification',
                 file: 'media.js'
             })
-
             if (isWhitelisted) {
+                respondAllowed = false
                 defaultLogger.info('Usuario en whitelist, finalizando flujo', {
-                    userId,
-                    numberPhone,
-                    name,
+                    userId, numberPhone, name,
                     action: 'whitelist_end_flow',
                     file: 'media.js'
                 })
                 return endFlow()
             }
 
-            // Validar estado global del chatbot
             const botStatus = await whatsappStatus()
             defaultLogger.info('Estado global del bot', {
-                userId,
-                numberPhone,
-                name,
-                botStatus,
+                userId, numberPhone, name, botStatus,
                 action: 'global_status_check',
                 file: 'media.js'
             })
-
             if (botStatus && !botStatus.status) {
+                respondAllowed = false
                 defaultLogger.info('Bot desactivado globalmente', {
-                    userId,
-                    numberPhone,
-                    name,
                     action: 'global_status_end_flow',
                     file: 'media.js'
                 })
                 return endFlow()
             }
 
-            // Validar estado individual del usuario
-            const userStatus = await getWhatsapp(numberPhone)
+            let userStatus = await getWhatsapp(numberPhone, { name, profilePictureUrl })
             defaultLogger.info('Estado del usuario', {
-                userId,
-                numberPhone,
-                name,
-                userStatus,
+                userId, numberPhone, name, userStatus,
                 action: 'user_status_check',
                 file: 'media.js'
             })
 
             if (userStatus && !userStatus.status) {
+                respondAllowed = false
                 defaultLogger.info('Usuario desactivado', {
-                    userId,
-                    numberPhone,
-                    name,
-                    action: 'user_disabled_end_flow',
-                    file: 'media.js'
-                })
-
-                // Procesar y guardar la imagen recibida
-                
-                const pathImg = await provider.saveFile(ctx, { path: `${MEDIA_DIR}/` })
-
-                defaultLogger.info('Imagen guardada', {
-                    userId,
-                    numberPhone,
-                    name,
-                    pathImg,
-                    action: 'image_saved',
-                    file: 'media.js'
-                })
-                const imageBuffer = fs.readFileSync(pathImg);
-                const base64Image = imageBuffer.toString('base64');
-                await postWhatsappConversation(numberPhone, mediaCaption, "", base64Image,"imagen","user");
-
-                return endFlow()
-            }
-
-
-            // Check premium plan status
-            const shouldEndFlow = await checkPremiumPlan(userId, numberPhone, name, provider)
-            if (shouldEndFlow) return endFlow()
-
-            // Procesar y guardar la imagen recibida
-            const pathImg = await provider.saveFile(ctx, { path: `${MEDIA_DIR}/` })
-
-            defaultLogger.info('Imagen guardada', {
-                userId,
-                numberPhone,
-                name,
-                pathImg,
-                action: 'image_saved',
-                file: 'media.js'
-            })
-
-            const responseImage = await processImage(pathImg, numberPhone, name)
-
-            if (!responseImage && !userStatus.status) {
-                defaultLogger.info('Usuario desactivado', {
-                    userId,
-                    numberPhone,
-                    name,
+                    userId, numberPhone, name,
                     action: 'user_disabled_end_flow',
                     file: 'media.js'
                 })
                 return endFlow()
             }
 
-            defaultLogger.info('Respuesta del modelo obtenida Imagen', {
-                userId,
-                numberPhone,
-                name,
-                modelResponse: responseImage.text,
-                action: 'model_response',
-                file: 'media.js'
-            })
-            // Get current conversation history from state
+            // Actualizar usuario NUEVO (igual que chatbot/voice ahora lo hacen)
+            if (!userStatus) {
+                 await putWhatsapp(numberPhone, name, true, profilePictureUrl)
+                defaultLogger.info('Nuevo usuario registrado', {
+                    userId, numberPhone, name, newUserStatus: userStatus,
+                    action: 'new_user_registration',
+                    file: 'media.js'
+                })
+            }
+
+
+            // Check premium plan
+            const shouldEndPremium = await checkPremiumPlan(userId, numberPhone, name, provider)
+            if (shouldEndPremium) return endFlow()
+
+            // ===== HISTORIAL (antes de procesar imagen, igual que chatbot/voice) =====
             const historyGlobalStatus = state.getMyState()?.history ?? []
-            // Check if there's no conversation history
             if (historyGlobalStatus.length <= 0) {
-                // Fetch conversation history from database
                 const historyDB = await getWhatsappConversation(numberPhone);
                 defaultLogger.info('Historial de conversación recuperado de la base de datos', {
-                    userId,
-                    numberPhone,
-                    name,
+                    userId, numberPhone, name,
                     historyLength: historyDB?.length || 0,
                     action: 'history_db_retrieved',
                     file: 'media.js'
                 })
-
                 defaultLogger.info('Estado actualizado con el historial de conversación', {
-                    userId,
-                    numberPhone,
-                    name,
+                    userId, numberPhone, name,
                     action: 'history_state_updated',
                     file: 'media.js'
                 })
                 await state.update({ history: historyDB })
             }
 
-            const newHistory = (state.getMyState()?.history ?? [])
-            const questionParts = [];
-
-            if (mediaCaption) {
-                questionParts.push(`El usuario envio esta imagen con el siguiente texto o caption: "${mediaCaption}".`);
+            // ============================================================
+            // VIDEO → mensaje fijo enviado como PREGUNTA a la IA.
+            // No se descarga ni procesa el video: se deriva a un asesor.
+            // ============================================================
+            if (isVideoMessageCtx(ctx)) {
+                defaultLogger.info('Video recibido → se envía como pregunta a la IA (llamar a un asesor)', {
+                    userId, numberPhone, name, messageId,
+                    question: VIDEO_ADVISOR_QUESTION,
+                    action: 'media_video_advisor_question_start',
+                    file: 'media.js'
+                })
+                await runCaptionOnlyAsText({
+                    captionRaw: VIDEO_ADVISOR_QUESTION,
+                    userContent: VIDEO_ADVISOR_QUESTION,
+                    ctx, numberPhone, userId, name,
+                    provider, flowDynamic, state, presence: null
+                })
+                return endFlow()
             }
 
-            if (responseImage?.text) {
-                questionParts.push(`Contenido detectado en la imagen: *${responseImage.text}*.`);
+            // ===== PROCESAR Y GUARDAR LA IMAGEN (1 SOLA VEZ AHORA - antes estaba duplicado) =====
+            // Protegemos SAVE + PROCESS individualmente con try/catch interno.
+            // Si sharp/webp o lo que sea falla en runtime, NO colgamos BuilderBot,
+            // NO hacemos que el usuario reciba silencio. Si es procesable sigue
+            // camino normal. Si NO, enviamos un mensaje SUAVE al usuario
+            // ("no pude procesar la imagen") y terminamos limpio.
+            // Esto evita que 1 imagen webp corrupta bloquee TODOS los mensajes
+            // siguientes en la cola secuencial del mismo número.
+            let pathImg = null
+            let saveImageError = null
+            try {
+                pathImg = await provider.saveFile(ctx, { path: `${process.cwd()}/media/` })
+                defaultLogger.info('Imagen guardada', {
+                    userId, numberPhone, name, pathImg,
+                    action: 'image_saved',
+                    file: 'media.js'
+                })
+            } catch (errSave) {
+                saveImageError = errSave
+                defaultLogger.error('Error al guardar imagen (saveFile). Terminamos flow limpio sin colgar.', {
+                    userId, numberPhone, name,
+                    error: errSave?.message || String(errSave),
+                    stack: errSave?.stack || null,
+                    action: 'image_savefile_error_graceful',
+                    file: 'media.js'
+                })
             }
 
-            questionParts.push('IMPORTANTE: usa el caption del usuario como contexto principal y la imagen como apoyo para responder.');
+            // ===== KEEP-ALIVE PRESENCIA "escribiendo…" =====
+            // Mantener estado durante: análisis de imagen + polling 25s + IA + respuesta.
+            // WhatsApp borra composing tras ~15s → refrescamos cada 10s.
+            // 🔥 INICIAMOS AQUÍ (después del throttle, guardado y setup) para no
+            //    activar loops en imágenes rechazadas por throttling.
+            presence = startPresenceKeepAlive(provider, ctx.key.remoteJid, {
+                presenceType: 'composing', file: 'media.js'
+            })
+            const stopPresenceSafe = async () => {
+                try { await new Promise(resolve => setTimeout(resolve, 5000)) } catch (_) {}
+                try { await presence.stop() } catch (_) {}
+            }
+            // Helper: limpiar archivo temporal + stop presence (para paths tempranos que borran img)
+            const cleanupImageAndPresence = async (imgPath) => {
+                if (imgPath) {
+                    try {
+                        fs.unlink(imgPath, (error) => {
+                            if (error) defaultLogger.error('Error eliminando Imagen', {
+                                userId, numberPhone, name, error: error.message,
+                                action: 'delete_image', file: 'media.js'
+                            })
+                        })
+                    } catch (_) {}
+                }
+                await stopPresenceSafe()
+            }
 
-            const question = questionParts.join('\n\n')
+            // ============================================================
+            // PATH RÁPIDO: si el saveFile falló (webp corrupto, error sharp
+            // pre-save, path sin permisos, etc.)
+            // 🟢 SI HAY CAPTION → NO SILENCIAR. Enviar mensaje genérico
+            //    IMAGE_DOWNLOAD_ERROR_MSG + luego responder el caption con IA.
+            // 🔴 SÓLO mensaje genérico si la imagen venía SIN caption.
+            // ============================================================
+            if (saveImageError || !pathImg) {
+                try { await provider.vendor.readMessages([ctx.key]).catch(() => {}) } catch (_) {}
+                try {
+                    await sendReplySafe(numberPhone, provider, flowDynamic, IMAGE_DOWNLOAD_ERROR_MSG)
+                } catch (_) {}
+                defaultLogger.warn('saveFile falló o pathImg vacío. Soft reply genérico enviado.', {
+                    userId, numberPhone, name,
+                    hasCaption: hasCaptionNow,
+                    saveImageErrorMessage: saveImageError?.message || null,
+                    action: 'image_savefile_error_generic_reply',
+                    file: 'media.js'
+                })
+                if (hasCaptionNow) {
+                    await runCaptionOnlyAsText({
+                        captionRaw: mediaCaption, ctx, numberPhone, userId, name,
+                        provider, flowDynamic, state, presence
+                    })
+                }
+                await cleanupImageAndPresence(null)
+                return endFlow()
+            }
 
-            newHistory.push({
-                role: 'user',
-                content: question
+            defaultLogger.info('Iniciando etapa de análisis y respuesta (imagen - único addAction)', {
+                userId, numberPhone, name, mediaCaption,
+                action: 'image_response_stage_start',
+                file: 'media.js'
             })
 
-            // Obtener respuesta del modelo
-            const response = await run(name, newHistory, question, numberPhone, responseImage.img)
-            defaultLogger.info('Respuesta del modelo obtenida Texto Imagen', {
-                userId,
-                numberPhone,
-                name,
-                modelResponse: response,
+            // ===== ANÁLISIS DE IMAGEN =====
+            let responseImage = null
+            let processImageError = null
+            try {
+                responseImage = await processImage(pathImg, numberPhone, name)
+            } catch (errProc) {
+                processImageError = errProc
+                defaultLogger.error('Error processImage (runtime sharp/openai o imagen corrupta). Graceful exit.', {
+                    userId, numberPhone, name,
+                    error: errProc?.message || String(errProc),
+                    stack: errProc?.stack || null,
+                    path: pathImg,
+                    action: 'image_process_error_graceful',
+                    file: 'media.js'
+                })
+            }
+            if (!responseImage) {
+                // Imagen vacía O error procesando.
+                // 🟢 SI HAY CAPTION: mensaje genérico + responder caption con IA.
+                // 🔴 SIN CAPTION: solo mensaje genérico.
+                defaultLogger.info('Procesamiento imagen retornó vacío / error (incluye errores silent).', {
+                    userId, numberPhone, name,
+                    processImageErrorMessage: processImageError?.message || null,
+                    hasCaption: hasCaptionNow,
+                    action: 'image_process_empty_or_error',
+                    file: 'media.js'
+                })
+                try { await provider.vendor.readMessages([ctx.key]).catch(() => {}) } catch (_) {}
+                try {
+                    await sendReplySafe(numberPhone, provider, flowDynamic, IMAGE_DOWNLOAD_ERROR_MSG)
+                } catch (_) {}
+                if (hasCaptionNow) {
+                    await runCaptionOnlyAsText({
+                        captionRaw: mediaCaption, ctx, numberPhone, userId, name,
+                        provider, flowDynamic, state, presence
+                    })
+                }
+                await cleanupImageAndPresence(pathImg)
+                return endFlow()
+            }
+            defaultLogger.info('Respuesta del modelo obtenida Imagen', {
+                userId, numberPhone, name,
+                modelResponse: responseImage.text,
                 action: 'model_response',
                 file: 'media.js'
             })
 
-            // Enviar respuesta en chunks
-            //const chunks = response.split(/(?<!\d)\.(?=\s|$)|:\n\n/g)
-            const chunks = response.split(/:\n\n|\n\n/)
-
-            for (const chunk of chunks) {
-                if(numberPhone.length <= 11){
-                        await provider.sendMessage(numberPhone, chunk.replace(/^[\n]+/, '').trim(), { media: null })
-                    }else{
-                        await flowDynamic(chunk.replace(/^[\n]+/, '').trim())
-                    }
-                    await sleep(2000)
+            // ============================================================
+            // UNIR CAPTION (texto usuario) + TEXTO OBTENIDO DE LA IMAGEN
+            // ============================================================
+            // - Prioridad: el caption del usuario es la fuente principal
+            //   (lo que el usuario quiso decir explícitamente).
+            // - El OCR / análisis de la imagen es apoyo contextual.
+            // - La unión se guarda en 3 sitios:
+            //     (a) combinedText variable local
+            //     (b) responseImage.text → para uso downstream y logs
+            //     (c) entry content al marcar READY en buffer
+            // ============================================================
+            const captionTrim = String(mediaCaption || '').trim()
+            const ocrTrim = String(responseImage.text || '').trim()
+            let combinedText = ''
+            if (captionTrim && ocrTrim) {
+                combinedText = `${captionTrim}\n\n[Contenido detectado en la imagen: ${ocrTrim}]`
+            } else if (captionTrim) {
+                combinedText = captionTrim
+            } else if (ocrTrim) {
+                combinedText = ocrTrim
+            }
+            if (combinedText) {
+                responseImage.text = combinedText
+                defaultLogger.info('Texto combinado (caption + imagen) generado', {
+                    userId, numberPhone, name,
+                    captionRaw: captionTrim ? captionTrim.slice(0, 150) : '',
+                    ocrRaw: ocrTrim ? ocrTrim.slice(0, 150) : '',
+                    combinedText: combinedText.slice(0, 300),
+                    action: 'image_caption_ocr_combined_ok',
+                    file: 'media.js'
+                })
             }
 
-            // Actualizar historial
-            newHistory.push({
-                role: 'assistant',
-                content: response
+            // ================ COORDINACIÓN COMPARTIDA: MARCAR IMAGEN READY ================
+            const imageQuestionParts = [];
+            if (captionTrim) {
+                imageQuestionParts.push(`El usuario envio esta imagen con el siguiente texto o caption: "${captionTrim}".`);
+            }
+            if (ocrTrim) {
+                imageQuestionParts.push(`Contenido detectado en la imagen: *${ocrTrim}*.`);
+            }
+            if (combinedText) {
+                imageQuestionParts.push(`TEXTO UNIFICADO que representa el mensaje completo del usuario: "${combinedText}".`);
+            }
+            imageQuestionParts.push('IMPORTANTE: usa el caption del usuario como contexto principal, el texto extraído de la imagen como apoyo, y prioriza el TEXTO UNIFICADO cuando corresponda para responder.');
+            const imageProcessedContent = imageQuestionParts.join('\n\n');
+
+            const st = state.getMyState() || {}
+            const flowVersion = Number(st.conversationVersion || myVersion || 0)
+            let myEntryId = st.conversationEntryId || null
+            if (!myEntryId || flowVersion > 0) {
+                const fallback = consumeLatestPendingOfType(numberPhone, 'image')
+                if (fallback && fallback.entryId) {
+                    if (!myEntryId) myEntryId = fallback.entryId
+                    pendingImage = fallback
+                }
+            }
+            defaultLogger.info('Imagen marcar READY procesada', {
+                userId, numberPhone, name,
+                flowVersion, myEntryId,
+                storedVersion: st.conversationVersion,
+                storedEntryId: st.conversationEntryId,
+                pendingImageEntryId: pendingImage ? pendingImage.entryId : null,
+                action: 'conversation_image_ready',
+                file: 'media.js'
             })
+            if (flowVersion > 0 && myEntryId) {
+                // content que almacenamos en la buffer entry: es el texto
+                // COMBINADO REAL (caption + OCR). Esto asegura que cuando
+                // consolidateRafagaForTurn construya combinedInput uniéndolo
+                // con mensajes de texto anteriores, aparezca la unión real.
+                // imageProcessedContent se usa solo como prompt interno de IA.
+                markMessageReady(numberPhone, myEntryId, {
+                    content: combinedText || imageProcessedContent,
+                    caption: captionTrim,
+                    extra: {
+                        imageAnalysisText: ocrTrim,
+                        captionRaw: captionTrim,
+                        combinedText
+                    },
+                    file: 'media.js'
+                })
+            }
+            // ==========================================================
 
-            // Eliminar los primeros 2 elementos
-            // Comprobar si el array tiene más de 20 elementos
-            if (newHistory.length > 20) {
-                // Eliminar los primeros 2 elementos si tiene más de 20 elementos
-                newHistory.splice(0, 2);
+            // ===== ALARMA USER SIDE (igual que chatbot/voice) =====
+            const shouldEndFlowUser = await processAlarm(ctx, numberPhone, name, provider, imageProcessedContent, "user")
+            if (shouldEndFlowUser) {
+                await cleanupImageAndPresence(pathImg)
+                return endFlow()
             }
 
-            await state.update({ history: newHistory })
+            // ============================================================
+            // 🔥 REGLA DE NEGOCIO: IMAGEN NUNCA VA POR CAMINO LEGACY.
+            //    La imagen DEBE esperar el waitForTurn con su ventana dinámica
+            //    de 45s para unificarse con texto/audio que el usuario envíe
+            //    DESPUÉS. Si pasa por legacy (<=0), responde SOLA y luego el
+            //    texto/audio llega aparte generando 2 respuestas.
+            // ============================================================
+            // Si el listener Baileys NUNCA insertó entry en buffer (myEntryId
+            // nulo o flowVersion<=0), CREAMOS una entry SINTÉTICA aquí para
+            // que la imagen entre al mismo ciclo de polling que los demás
+            // flujos y use la misma lógica "último tipo gana".
+            // ============================================================
+            if (Number(flowVersion || 0) <= 0 || !myEntryId) {
+                // Levantamos flowVersion y/o insertamos entry sintética.
+                const bump = bumpConversationVersion(numberPhone) || 0
+                const synVersion = Number(bump && bump.newVersion ? bump.newVersion : (getCurrentVersion(numberPhone) || 1)) || 1
+                const synId = `syn_img_${Date.now()}_${Math.random().toString(36).slice(2,8)}`
+                const captionRaw = String(mediaCaption || '').trim()
+                const combinedContent = combinedText || imageProcessedContent
+                // Mark message synthetic con status READY (ya procesamos la imagen
+                // localmente). Así cumple allReady del consolidador.
+                registerSyntheticMessage(numberPhone, {
+                    id: synId,
+                    messageId: messageId || null,
+                    type: 'image',
+                    content: combinedContent,
+                    caption: captionRaw,
+                    extra: {
+                        imageAnalysisText: ocrTrim,
+                        captionRaw,
+                        combinedText: combinedText || '',
+                        synthetic: true,
+                        sourceFlow: 'media.js_legacy_missing_entry'
+                    }
+                }, { ready: true })
+                flowVersion = synVersion
+                if (!myEntryId) myEntryId = synId
+                defaultLogger.info('Imagen sin entry en buffer: creada entry sintética para coordinar waitForTurn unificado.', {
+                    userId, numberPhone, name,
+                    syntheticEntryId: synId,
+                    syntheticVersion: synVersion,
+                    messageIdProvided: Boolean(messageId),
+                    myEntryId,
+                    combinedTextPreview: combinedText ? String(combinedText).slice(0, 200) : null,
+                    action: 'media_image_synthetic_entry_created_waitforturn',
+                    file: 'media.js'
+                })
+            }
 
-            responseImage.text = responseImage.text.replace(/\n/g, "<br>").replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
+            // ============================================================
+            // GUARD DE RÁFAGA VIVA (redundante pero queda defensivo).
+            // ============================================================
+            if (Number(flowVersion || 0) <= 0) {
+                const rafagaInfo = isRafagaVivaActive(numberPhone, { file: 'media.js' })
+                if (rafagaInfo && rafagaInfo.active) {
+                    const newFlowVer = Number(getCurrentVersion(numberPhone) || 1) || 1
+                    defaultLogger.info('Media imagen: ráfaga viva detectada. Forzando camino coordinado (no legacy) para unificar en 1 respuesta.', {
+                        userId, numberPhone, name,
+                        newCoordinatedVersion: newFlowVer,
+                        rafagaDetail: {
+                            bufferCount: rafagaInfo.bufferCount,
+                            uniqueTypes: rafagaInfo.uniqueTypes,
+                            sinceLastMs: rafagaInfo.sinceLastMs
+                        },
+                        action: 'media_rafaga_viva_force_coordinated_path',
+                        file: 'media.js'
+                    })
+                    flowVersion = newFlowVer
+                }
+            }
 
-            // Notificar al vendedor sobre el nuevo comprobante
-            const responseAlarm = await putWhatsappEmailVendor(
-                numberPhone,
-                name,
-                `<br><br>${responseImage.text}<br>`,
-                responseImage.img
-            )
+            if (Number(flowVersion || 0) <= 0) {
+                // ======== CAMINO LEGACY (sin coordinación) ========
+                // newHistory guarda COMBINEDTEXT como texto user real (no el
+                // prompt interno imageProcessedContent). run() recibe
+                // imageProcessedContent como prompt guía (incluye hints de
+                // prioridad caption + OCR).
+                const greetingResetHere = isGreetingResetTrigger(combinedText || '')
+                const newHistory = greetingResetHere ? [] : (state.getMyState()?.history ?? []).slice()
+                if (greetingResetHere) {
+                    await state.update({ history: [] }).catch(() => {})
+                    defaultLogger.info('Saludo en imagen (caption/OCR) → RESET historial (legacy img)', {
+                        userId, numberPhone, name, combinedText,
+                        action: 'history_greeting_reset_legacy',
+                        file: 'media.js'
+                    })
+                }
+                newHistory.push({ role: 'user', content: combinedText || imageProcessedContent })
+                const response = await run(name, newHistory, imageProcessedContent, numberPhone, responseImage.img)
+                defaultLogger.info('Respuesta del modelo obtenida Texto Imagen (legacy). FLUJO COMPROMETIDO: NO INVALIDAR POR NADA', {
+                    userId, numberPhone, name,
+                    modelResponse: response,
+                    action: 'model_response_legacy',
+                    combinedTextPreview: combinedText ? combinedText.slice(0, 300) : null,
+                    note: 'DESPUÉS DE ESTE PUNTO, SIN 2ª VALIDACIÓN, SE RESPONDE OBLIGATORIAMENTE',
+                    file: 'media.js'
+                })
+                await respondAndFinalize({
+                    response,
+                    combinedMessages: combinedText || imageProcessedContent,
+                    image: responseImage,
+                    name, numberPhone, userId, ctx, provider, flowDynamic, state, pathImg
+                })
+                await stopPresenceSafe()
+                return endFlow()
+            }
 
-            defaultLogger.info('Notificación enviada al vendedor', {
-                userId,
-                numberPhone,
-                name,
-                responseAlarm,
-                action: 'vendor_notification_sent',
+            // ======== CAMINO COORDINADO (igual que chatbot/voice) ========
+            const turn = await waitForTurn(numberPhone, {
+                flowVersion,
+                flowType: 'image',
+                flowId: `image_${myEntryId || ''}`,
+                file: 'media.js'
+            })
+            if (!turn.acquired) {
+                defaultLogger.info('Flujo imagen cede turno (invalidado)', {
+                    userId, numberPhone, name,
+                    flowVersion,
+                    finalVersion: turn.finalVersion,
+                    cancelReason: turn.cancelReason,
+                    action: 'conversation_image_cede',
+                    file: 'media.js'
+                })
+                await cleanupImageAndPresence(pathImg)
+                return endFlow()
+            }
+
+            // El CONSOLIDADOR (consolidateRafagaForTurn) ya unió entries de
+            // tipo texto/audio/imagen con sus content REALES guardados en
+            // markMessageReady (combinedText para la imagen). Si el turn
+            // tiene combinedInput, lo usamos tal cual (ya trae la unión
+            // real ráfaga). Si no, fallback a combinedText.
+            const combinedInput = turn.combinedInput || combinedText || imageProcessedContent
+            const greetingResetHere = isGreetingResetTrigger(combinedInput)
+            const newHistory = greetingResetHere ? [] : (state.getMyState()?.history ?? []).slice()
+            if (greetingResetHere) {
+                await state.update({ history: [] }).catch(() => {})
+                defaultLogger.info('Saludo en imagen (caption/OCR) → RESET historial (coordinado img)', {
+                    userId, numberPhone, name, combinedInput,
+                    action: 'history_greeting_reset_coordinated',
+                    file: 'media.js'
+                })
+            }
+            newHistory.push({ role: 'user', content: combinedInput })
+
+            defaultLogger.info('Procesando mensajes acumulados (coordinación imagen)', {
+                userId, numberPhone, name,
+                flowVersion,
+                combinedLength: String(combinedInput).length,
+                combinedPreview: String(combinedInput).slice(0, 300),
+                historyLength: newHistory.length,
+                action: 'processing_messages_shared_image',
                 file: 'media.js'
             })
 
-            // Call the alarm processing method
-            const shouldEndFlowAlarm = await processAlarm(ctx, numberPhone, name, response)
-            if (shouldEndFlowAlarm) return endFlow()
+            defaultLogger.info('Inicio consulta IA (imagen, coordinado)', {
+                userId, numberPhone, name,
+                flowVersion,
+                combinedLength: String(combinedInput).length,
+                action: 'conversation_ai_request_start',
+                file: 'media.js'
+            })
+            const response = await run(name, newHistory, imageProcessedContent, numberPhone, responseImage.img)
+            defaultLogger.info('Respuesta del modelo obtenida (imagen, coordinado). FLUJO COMPROMETIDO: NO INVALIDAR POR NADA, RESPONDER SIEMPRE', {
+                userId, numberPhone, name,
+                flowVersion,
+                modelResponse: response,
+                action: 'conversation_ai_response_done',
+                note: 'DESPUÉS DE ESTE PUNTO, SIN 2ª VALIDACIÓN, SE RESPONDE OBLIGATORIAMENTE',
+                file: 'media.js'
+            })
 
-            fs.unlink(pathImg, (error) => {
-                if (error) {
-                    defaultLogger.error('Error eliminando Imagen', {
-                        userId,
-                        numberPhone,
-                        name,
-                        error: error.message,
-                        action: 'delete_image',
-                        file: 'media.js'
-                    });
-                }
-            });
-
+            // ✅ REGLA DE NEGOCIO: no hay 2ª validación isStillMyTurn aquí.
+            //    Si llegamos hasta aquí con respuesta IA, se envía sí o sí.
+            // Alarm IA-side ESTÁ DENTRO de respondAndFinalize (ya lo tenía media.js originalmente)
+            await respondAndFinalize({
+                response,
+                combinedMessages: combinedInput,
+                image: responseImage,
+                name, numberPhone, userId, ctx, provider, flowDynamic, state,
+                // 🔴 Limpiar con la versión REAL adquirida (turn.finalVersion), no con la
+                // de nacimiento: evita preservar/renumerar mensajes ya respondidos y
+                // reinyectarlos como "nuevos" en el siguiente combinedInput.
+                flowVersion: turn.finalVersion,
+                pathImg
+            })
+            await stopPresenceSafe()
             return endFlow()
 
         } catch (error) {
-            defaultLogger.error('Error en flujo de medios', {
-                userId: extractUserId(ctx),
-                numberPhone: extractNumber(ctx),
-                name: extractName(ctx),
+            defaultLogger.error('Error en flujo de medios (único addAction) → Respuesta SUAVE no silencio.', {
+                userId, numberPhone, name,
                 error: error.message,
                 stack: error.stack,
                 context: ctx,
+                hasCaption: hasCaptionNow,
+                action: 'media_flow_trycatch_generic_error',
                 file: 'media.js'
             })
+            // 🟢 SIEMPRE responder algo. No dejar usuario en SILENCIO.
+            // EXCEPCIÓN: si el bot global o el contacto están desactivados (o el
+            // número está en whitelist), NO se responde. Re-verificamos porque el
+            // error pudo ocurrir ANTES de las validaciones (p. ej. foto de perfil).
+            let canReply = respondAllowed
+            if (canReply) {
+                canReply = await isReplyAllowedForNumber(numberPhone, { name, file: 'media.js' })
+            }
+            if (!canReply) {
+                defaultLogger.info('Error en flujo de medios pero bot/contacto desactivado o whitelist → NO se responde', {
+                    userId, numberPhone, name,
+                    respondAllowed,
+                    action: 'media_flow_catch_skip_reply_disabled',
+                    file: 'media.js'
+                })
+                return endFlow()
+            }
+            try {
+                try { if (ctx && ctx.key) await provider.vendor.readMessages([ctx.key]).catch(() => {}) } catch (_) {}
+                try {
+                    await sendReplySafe(numberPhone, provider, flowDynamic, IMAGE_DOWNLOAD_ERROR_MSG)
+                } catch (_) {}
+                if (hasCaptionNow) {
+                    await runCaptionOnlyAsText({
+                        captionRaw: mediaCaption, ctx, numberPhone, userId, name,
+                        provider, flowDynamic, state, presence: null
+                    })
+                }
+            } catch (_superFinal) {
+                defaultLogger.debug('Catch final generic media: super error enviando replies. SILENCIO evitable, logueado.', {
+                    userId, numberPhone,
+                    error: _superFinal?.message || String(_superFinal),
+                    action: 'media_flow_generic_catch_final_reply_error',
+                    file: 'media.js'
+                })
+            }
             return endFlow()
-        }finally{
-            await markMessageSeen(provider, ctx)
+        } finally {
+            if (presence) await presence.stop()
+            try {
+                // Parada defensiva (siempre paused). Los paths exitosos ya llamaron
+                // a stopPresenceSafe (con 5s grace + interval clear). Aquí sin sleep
+                // para no bloquear el finally de BuilderBot.
+                if (provider?.vendor?.sendPresenceUpdate && ctx?.key?.remoteJid) {
+                    try { await provider.vendor.sendPresenceUpdate('paused', ctx.key.remoteJid) } catch (_) {}
+                }
+            } catch (_) { /* no-op */ }
         }
+    }
+
+// respondAndFinalize para flujo de imagen (encapsula: duplicado, alarma, chunks, historial, email vendor, limpiar img)
+const respondAndFinalize = async ({
+    response,
+    combinedMessages,
+    image,
+    name,
+    numberPhone,
+    userId,
+    ctx,
+    provider,
+    flowDynamic,
+    state,
+    flowVersion,
+    pathImg
+}) => {
+    // Procesar orden "datos recibidos" (PRIMERO. Predomina sobre alarma.)
+    if (response.toLowerCase().includes("datos recibidos")) {
+        const whatsappPrompt = await promptGetWhatsapp(combinedMessages);
+        if (whatsappPrompt.products_dynamic) {
+            const updatePrompt = await runUpdatePromptServicesProduct(response);
+            defaultLogger.info('Prompt actualizado (media/img)', {
+                userId, numberPhone, name, updatePrompt,
+                action: 'update_prompt_complete', file: 'media.js'
+            });
+            const responseUpdateProductWhatsapp = await promptUpdateProductWhatsapp(updatePrompt);
+            defaultLogger.info('Respuesta de actualización de producto prompt (media/img)', {
+                userId, numberPhone, name, responseUpdateProductWhatsapp,
+                action: 'product_update_response', file: 'media.js'
+            });
+        }
+        const orderConfirmation = await putWhatsappOrderConfirmation(name, numberPhone, response, "pending_payment")
+        defaultLogger.info('Orden procesada (media/img)', {
+            userId, numberPhone, name, response, orderConfirmation,
+            action: 'order_processing', file: 'media.js'
+        })
+        await putWhatsapp(numberPhone, name, false)
+
+    } else {
+        // Alarm IA (solo si NO hubo "datos recibidos", para no duplicar putWhatsapp
+        // ni cancelar la orden recién creada por una alarma incidental en la misma respuesta.)
+        const shouldEndFlowAlarm = await processAlarm(ctx, numberPhone, name, provider, response, "IA")
+        if (shouldEndFlowAlarm) {
+            if (pathImg) fs.unlink(pathImg, (error) => {
+                if (error) defaultLogger.error('Error eliminando Imagen', { userId, numberPhone, name, error: error.message, action: 'delete_image', file: 'media.js' });
+            });
+            return { alarm: true }
+        }
+    }
+
+    // ✅ MARCAR LEÍDO SÓLO AQUÍ (después de run + isStillMyTurn + alarm IA, justo ANTES de enviar respuesta)
+    // Nota: respondAndFinalize es llamado SÓLO cuando todos los checks anteriores pasaron (legacy y coordinado).
+    try { if (ctx && ctx.key) await provider.vendor.readMessages([ctx.key]) } catch (_) {}
+
+    defaultLogger.info('Enviando respuesta final al usuario (media)', {
+        numberPhone, userId,
+        responseLength: String(response).length,
+        flowVersion: flowVersion !== undefined ? flowVersion : 'legacy',
+        responsePreview: String(response).slice(0, 200),
+        action: flowVersion !== undefined ? 'conversation_image_response_sending' : 'response_sending',
+        file: 'media.js'
     })
+
+    if (numberPhone.length <= 11) {
+        await provider.sendMessage(numberPhone, response, { media: null })
+    } else {
+        await flowDynamic(response)
+    }
+
+    // Actualizar historial
+    const st = state.getMyState() || {}
+    const newHistory = (st.history ?? []).slice()
+    if (newHistory.length === 0 || newHistory[newHistory.length - 1].role !== 'user' || newHistory[newHistory.length - 1].content !== combinedMessages) {
+        newHistory.push({ role: 'user', content: combinedMessages })
+    }
+    newHistory.push({ role: 'assistant', content: response })
+    if (newHistory.length > 20) newHistory.splice(0, 2)
+    await state.update({ history: newHistory })
+
+    // Notificación al vendedor (la conservamos solo para imagen, como hacía originalmente media.js)
+    try {
+        if (image && typeof image === 'object' && image.text) {
+            const htmlText = String(image.text)
+                .replace(/\n/g, "<br>")
+                .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
+            const responseAlarm = await putWhatsappEmailVendor(
+                numberPhone,
+                name,
+                `<br><br>${htmlText}<br>`,
+                image.img
+            )
+            defaultLogger.info('Notificación enviada al vendedor', {
+                userId, numberPhone, name, responseAlarm,
+                action: 'vendor_notification_sent',
+                file: 'media.js'
+            })
+        }
+    } catch (e) {
+        defaultLogger.error('Error al notificar al vendedor', {
+            userId, numberPhone, name,
+            error: e.message, action: 'vendor_notification_error',
+            file: 'media.js'
+        })
+    }
+
+    // Limpiar buffer coordinado (solo después de enviar OK)
+    if (flowVersion !== undefined) {
+        clearConversationAfterResponse(numberPhone, {
+            finalVersion: flowVersion,
+            file: 'media.js'
+        })
+    }
+
+    defaultLogger.info('Respuesta enviada correctamente (media)', {
+        numberPhone, userId,
+        flowVersion: flowVersion !== undefined ? flowVersion : 'legacy',
+        historyLength: newHistory.length,
+        action: flowVersion !== undefined ? 'conversation_image_response_sent' : 'response_sent',
+        file: 'media.js'
+    })
+
+    // Limpiar imagen temporal
+    if (pathImg) {
+        fs.unlink(pathImg, (error) => {
+            if (error) defaultLogger.error('Error eliminando Imagen', { userId, numberPhone, name, error: error.message, action: 'delete_image', file: 'media.js' });
+        });
+    } else if (image && typeof image === 'object' && image._path) {
+        fs.unlink(image._path, (error) => {
+            if (error) defaultLogger.error('Error eliminando Imagen', { userId, numberPhone, name, error: error.message, action: 'delete_image', file: 'media.js' });
+        });
+    }
+
+    return { ok: true }
+}

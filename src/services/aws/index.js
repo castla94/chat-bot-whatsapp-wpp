@@ -5,7 +5,19 @@ dotenv.config();
 import { runAnalyzeText } from '../openai/index.js';
 
 // Constantes para configuración
-const BASE_URL = 'https://c0jkurvt19.execute-api.us-east-1.amazonaws.com/DEV';
+const BASE_URL = (process.env.WHATSAPP_API_BASE_URL || 'https://c0jkurvt19.execute-api.us-east-1.amazonaws.com/DEV').replace(/\/$/, '');
+axios.defaults.timeout = Number(process.env.HTTP_TIMEOUT_MS) || 30000;
+axios.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    defaultLogger.error('Falló una solicitud al backend', {
+      endpoint: error.config?.url?.split('?')[0], method: error.config?.method,
+      status: error.response?.status, code: error.code, error: error.message,
+      action: 'backend_request_error',
+    });
+    return Promise.reject(error);
+  }
+);
 
 /**
  * Registra créditos para el sistema WhatsApp
@@ -181,13 +193,39 @@ export const getWhatsappWhitelist = async (phone) => {
  * @param {string} number - Número a consultar
  * @returns {Promise<Object|null>} Datos del número o null si hay error
  */
-export const getWhatsapp = async (number) => {
+export const getWhatsapp = async (number, options = {}) => {
   const endpoint = `${BASE_URL}/whatsapp`;
   const email = process.env.EMAIL_TOKEN;
+  const name = String(options?.name || '').trim();
+  const profilePictureUrl = String(options?.profilePictureUrl || '').trim();
 
   try {
     const response = await axios.get(endpoint, { params: { number, email } });
-    return response.data;
+    const userStatus = response.data;
+
+    if (userStatus && !userStatus.profile_picture && profilePictureUrl) {
+      defaultLogger.info('Completando profile_picture faltante en WhatsApp', {
+        number,
+        name: userStatus.name || name,
+        profilePictureUrl,
+        action: 'backfill_profile_picture',
+        file: 'aws/index.js'
+      });
+
+      await putWhatsapp(
+        number,
+        userStatus.name || name,
+        typeof userStatus.status === 'boolean' ? userStatus.status : true,
+        profilePictureUrl
+      );
+
+      return {
+        ...userStatus,
+        profile_picture: profilePictureUrl
+      };
+    }
+
+    return userStatus;
   } catch (error) {
     defaultLogger.error('Error obteniendo información de WhatsApp', {
       number,
@@ -207,7 +245,7 @@ export const getWhatsapp = async (number) => {
  * @param {boolean} status - Estado a establecer
  * @returns {Promise<Object|null>} Respuesta de la API o null si hay error
  */
-export const putWhatsapp = async (number, name, status) => {
+export const putWhatsapp = async (number, name, status, profilePicture = "") => {
   const endpoint = `${BASE_URL}/whatsapp`;
   const email = process.env.EMAIL_TOKEN;
 
@@ -216,7 +254,8 @@ export const putWhatsapp = async (number, name, status) => {
       email,
       name,
       number,
-      status
+      status,
+      ...(profilePicture ? { profile_picture: profilePicture } : {})
     });
     return response.data;
   } catch (error) {
@@ -224,6 +263,7 @@ export const putWhatsapp = async (number, name, status) => {
       number,
       name,
       status,
+      profilePicture,
       error: error.message,
       stack: error.stack,
       action: 'put_whatsapp_error',
@@ -313,7 +353,7 @@ export const putWhatsappOrderConfirmation = async (name, phone, message, status)
     String(now.getHours()).padStart(2, '0'),
     String(now.getMinutes()).padStart(2, '0')
   ].join('');
-  
+
   const order_number = `${formattedDate}-${phone}`;
 
   // Analizar y estandarizar el mensaje de la orden
@@ -353,7 +393,7 @@ export const putWhatsappOrderConfirmation = async (name, phone, message, status)
       message,
       error: error.message,
       stack: error.stack,
-      action: 'analyze_order_message_error', 
+      action: 'analyze_order_message_error',
       file: 'aws/index.js'
     });
   }
@@ -408,14 +448,16 @@ export const whatsappStatus = async () => {
 
 /**
  * Obtiene el prompt configurado para WhatsApp
+ * @param {string} question - Pregunta o consulta del cliente
+ * @param {string} phone - Número de teléfono del cliente
  * @returns {Promise<Object|null>} Configuración del prompt o null si hay error
  */
-export const promptGetWhatsapp = async (question) => {
+export const promptGetWhatsapp = async (question, phone) => {
   const endpoint = `${BASE_URL}/whatsapp-prompt`;
   const email = process.env.EMAIL_TOKEN;
 
   try {
-    const response = await axios.post(endpoint, { email, question });
+    const response = await axios.post(endpoint, { email, question, phone });
     return response.data;
   } catch (error) {
     defaultLogger.error('Error obteniendo prompt', {
