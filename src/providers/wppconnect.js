@@ -201,7 +201,7 @@ class WppProvider {
     this.pruneSent();
     const pending = { to: this.resolve(to), type, body, time: Date.now() };
     this.pendingSends.add(pending);
-    this.logger.info('WPPConnect: enviando respuesta', {
+    this.logger.info('enviando respuesta', {
       to: pending.to, type, messageBody: body, action: 'wpp_send_start',
     });
     try {
@@ -209,12 +209,12 @@ class WppProvider {
       const id = getMessageId(result);
       if (id) this.sentIds.set(id, Date.now());
       this.recentSends.add({ ...pending, id, completedAt: Date.now() });
-      this.logger.info('WPPConnect: respuesta enviada', {
+      this.logger.info('respuesta enviada', {
         to: pending.to, type, messageId: id, action: 'wpp_send_success',
       });
       return result;
     } catch (error) {
-      this.logger.error('WPPConnect: no se pudo enviar la respuesta', {
+      this.logger.error('no se pudo enviar la respuesta', {
         to: pending.to, type, error: error.message, action: 'wpp_send_error',
       });
       throw error;

@@ -82,14 +82,6 @@ async function createBusinessRuntime(client, dependencies) {
       messageBody: message.type === 'chat' ? message.body : undefined,
       caption: message.caption || '', eventSource,
     };
-    if (!message.fromMe) {
-      logger.info('Evento de mensaje WhatsApp recibido', {
-        action: 'whatsapp_raw_message', messageId: details.messageId,
-        upsertType: eventSource, hasPayload: Boolean(message.body || message.isMedia || ['ptt', 'audio', 'image'].includes(message.type)),
-        messageTypes: [message.type],
-      });
-    }
-    logger.info('WPPConnect: mensaje recibido', { ...details, action: 'wpp_message_received' });
     const reason = stopped ? 'bot_detenido'
       : message.fromMe ? 'mensaje_propio'
       : message.isGroupMsg || /@g\.us$/.test(message.from || '') ? 'grupo'
@@ -105,18 +97,14 @@ async function createBusinessRuntime(client, dependencies) {
           action: 'conversation_listener_noise_skip', file: 'app.js',
         });
       }
-      logger.info('WPPConnect: mensaje descartado', {
-        ...details, reason,
-        action: 'wpp_message_skipped',
-      });
       return;
     }
     const ctx = await provider.context(message);
-    logger.info('WPPConnect: contacto identificado', {
+    logger.info('contacto identificado', {
       ...details, numberPhone: ctx.from, chatId: ctx.key.remoteJid, action: 'wpp_contact_resolved',
     });
     if (message.type === 'chat' && !ctx.body.trim()) {
-      logger.info('WPPConnect: texto vacío, sin consulta IA', { ...details, numberPhone: ctx.from, action: 'wpp_empty_text' });
+      logger.info('texto vacío, sin consulta IA', { ...details, numberPhone: ctx.from, action: 'wpp_empty_text' });
       return;
     }
     logger.debug?.('Listener raw: mensaje candidato a buffer', {

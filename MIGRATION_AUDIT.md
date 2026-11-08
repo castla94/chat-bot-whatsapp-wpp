@@ -4,7 +4,7 @@ Comparación contra `/Users/freyes/Documents/DEVELOPMENT/chat-bot-whatsapp`, inc
 
 ## Logs y procesos
 
-- La auditoría estática revisa 269 referencias de mensajes de log en `app.js`, flujos, helpers y servicios. No hay mensajes ni acciones originales faltantes. La referencia a `baileys.log` se adapta a `logs/bot.log`, conservando `whatsapp_auth_failure`.
+- La auditoría estática revisa 269 referencias de mensajes de log en `app.js`, flujos, helpers y servicios. Se excluyen expresamente los logs `whatsapp_raw_message`, `wpp_message_skipped` y `wpp_message_received`, eliminados por petición del usuario. La referencia a `baileys.log` se adapta a `logs/bot.log`, conservando `whatsapp_auth_failure`.
 - Se mantienen los logs de validación de whitelist, estado global/contacto, plan, créditos, historial, alarmas, productos, pedidos, procesamiento de voz/imagen y coordinación del buffer.
 - Se restauran los mensajes y acciones de entrada al buffer, detección manual, estado del contacto, desactivación, omisión por contacto inexistente/whitelist y envíos por Express.
 - Los eventos equivalentes del proveedor anterior se reciben mediante WPPConnect. Las etiquetas `file: app.js` de sus procesos se conservan para facilitar las búsquedas de logs existentes.

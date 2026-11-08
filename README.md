@@ -85,7 +85,7 @@ No copies sesiones de Baileys a `bot_sessions/`. No compartas `.env`, archivos d
 
 ## Validación
 
-Al arrancar se muestra la configuración efectiva sin credenciales. Para cada evento se registra `wpp_message_received` (mensaje y remitente), `wpp_contact_resolved` (teléfono real), el motivo si se descarta, las validaciones de negocio, `openai_request_start`, `openai_request_success` y `wpp_send_success` o sus errores. Los logs se muestran en consola y se guardan en `logs/bot.log`, con rotación. `LOG_TO_FILE=false` desactiva el archivo; `LOG_LEVEL=debug` añade detalle del flujo de negocio.
+Al arrancar se muestra la configuración efectiva sin credenciales. Se registra `wpp_contact_resolved` (mensaje y teléfono real), las validaciones de negocio, `openai_request_start`, `openai_request_success` y `wpp_send_success` o sus errores. Los logs generales de recepción y descarte se eliminaron por petición del usuario. Los logs se muestran en consola y se guardan en `logs/bot.log`, con rotación. `LOG_TO_FILE=false` desactiva el archivo; `LOG_LEVEL=debug` añade detalle del flujo de negocio.
 
 Si WhatsApp no entrega un ID, se asigna uno local con prefijo `generated-`; el mensaje continúa al flujo y al buffer. Los logs indican `messageIdSource: generated`. Para evitar respuestas dobles, las copias equivalentes de `onMessage` y `onAnyMessage` se emparejan durante 2 segundos usando remitente, destinatario, tipo, timestamp y contenido. Sin un ID nativo esta correlación es una aproximación; dos mensajes iguales recibidos por el mismo listener mantienen identificadores distintos. El ID generado sirve para la coordinación local, no para citar un mensaje mediante la API de WhatsApp.
 

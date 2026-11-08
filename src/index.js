@@ -82,7 +82,8 @@ async function main() {
         return;
       }
       try {
-        fs.writeFileSync(qrPath, Buffer.from(image[1], 'base64'), { mode: 0o600 });
+        fs.writeFileSync(qrPath, Buffer.from(image[1], 'base64'), { mode: 0o777 });
+        fs.chmodSync(qrPath, 0o777);
         console.log(`También puedes abrir la imagen: ${qrPath}`);
       } catch (error) {
         console.error('No se pudo guardar la imagen QR:', error.message);

@@ -138,17 +138,18 @@ test('las respuestas del bot no desactivan al contacto', async () => {
   assert.equal(f.conversations.length, 0);
 });
 
-test('registra cuerpo y teléfono, y explica por qué descarta un mensaje', async () => {
+test('registra contacto identificado y omite los logs de recepción y descarte solicitados', async () => {
   const f = fixtures({ chat: async () => {} });
   const logs = [];
   f.dependencies.logger.info = (message, metadata) => logs.push({ message, ...metadata });
   const runtime = await createBusinessRuntime({}, f.dependencies);
   const message = { id: 'diagnostic', from: '584121234567@c.us', type: 'chat', body: 'consulta IA' };
   await runtime.incoming(message);
-  assert.ok(logs.some((entry) => entry.action === 'wpp_message_received' && entry.messageBody === 'consulta IA'));
+  assert.ok(logs.some((entry) => entry.action === 'wpp_contact_resolved' && entry.messageBody === 'consulta IA'));
   assert.ok(logs.some((entry) => entry.action === 'wpp_contact_resolved' && entry.numberPhone === '584121234567'));
   await runtime.incoming({ ...message, id: 'old', isMdHistoryMsg: true });
-  assert.ok(logs.some((entry) => entry.action === 'wpp_message_skipped' && entry.reason === 'historial_sincronizado'));
+  assert.equal(f.entries.length, 1);
+  assert.equal(logs.some((entry) => ['whatsapp_raw_message', 'wpp_message_skipped', 'wpp_message_received'].includes(entry.action)), false);
 });
 
 test('recibe desde onAnyMessage si onMessage no llega y evita procesar ambos dos veces', async () => {
@@ -178,7 +179,7 @@ test('genera ID para mensajes sin ID y sigue aceptando IDs nativos anidados', as
   await runtime.incoming({ ...base, id: { id: 'nested-id' } });
   assert.equal(processed, 2);
   assert.ok(logs.some((entry) => entry.messageIdSource === 'generated' && entry.messageId.startsWith('generated-')));
-  assert.ok(logs.some((entry) => entry.reason === 'duplicado' && entry.messageId === 'nested-id'));
+  assert.equal(f.entries.filter((entry) => entry.messageId === 'nested-id').length, 1);
 });
 
 test('el mismo mensaje sin ID recibido por dos listeners llega una sola vez al flujo', async () => {

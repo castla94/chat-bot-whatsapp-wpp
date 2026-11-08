@@ -26,14 +26,17 @@ let checked = 0;
 const missing = [];
 const targetActions = new Set([...targetText.matchAll(/action:\s*['"]([^'"]+)['"]/g)].map((match) => match[1]));
 const missingActions = [];
+// Logs eliminados por petición explícita del usuario.
+const omittedMessages = new Set(['Evento de mensaje WhatsApp recibido']);
+const omittedActions = new Set(['whatsapp_raw_message', 'wpp_message_skipped', 'wpp_message_received']);
 for (const relative of originFiles) {
   const originText = fs.readFileSync(path.join(source, relative), 'utf8');
   for (const message of messages(originText)) {
     checked++;
-    if (!targetMessages.has(replacements.get(message) || message)) missing.push({ file: relative, message });
+    if (!omittedMessages.has(message) && !targetMessages.has(replacements.get(message) || message)) missing.push({ file: relative, message });
   }
   for (const action of new Set([...originText.matchAll(/action:\s*['"]([^'"]+)['"]/g)].map((match) => match[1]))) {
-    if (!targetActions.has(action)) missingActions.push({ file: relative, action });
+    if (!omittedActions.has(action) && !targetActions.has(action)) missingActions.push({ file: relative, action });
   }
 }
 console.log(JSON.stringify({ checkedMessages: checked, missing, missingActions, providerSpecificReplacements: Object.fromEntries(replacements) }, null, 2));
