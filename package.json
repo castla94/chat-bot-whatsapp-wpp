@@ -16,7 +16,7 @@
     "node": ">=22.9.0"
   },
   "dependencies": {
-    "@wppconnect-team/wppconnect": "^2.3.6",
+    "@wppconnect-team/wppconnect": "^2.4.0",
     "@aws-sdk/client-cloudwatch-logs": "^3.0.0",
     "axios": "^1.7.3",
     "cache-manager": "5.2.4",
