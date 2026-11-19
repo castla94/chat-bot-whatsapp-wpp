@@ -19,6 +19,28 @@ const isEnvTrue = (value) => {
 const ENABLE_MODEL_CLASSIFICATION = isEnvTrue(process.env.ENABLE_MODEL_CLASSIFICATION);
 const DEFAULT_OPENAI_MODEL = "gpt-4.1-mini";
 
+const ADMIN_CREDIT_EMAIL = 'admin@telknec.cl';
+const ADMIN_CREDIT_REFILL = 1000;
+
+// Obtiene los créditos disponibles. Si el backend corresponde al administrador
+// y el saldo está en 0, recarga 1000 créditos y continúa la respuesta normal.
+const ensureAvailableCredits = async () => {
+    const availableCredits = await getWhatsappCredit();
+
+    if (availableCredits <= 0 && String(process.env.EMAIL_TOKEN || '').trim() === ADMIN_CREDIT_EMAIL) {
+        defaultLogger.info('Sin créditos: recargando créditos de administrador', {
+            availableCredits,
+            restoredCredits: ADMIN_CREDIT_REFILL,
+            action: 'admin_credit_refill',
+            file: 'openai/index.js'
+        });
+        await postWhatsappCredit(String(ADMIN_CREDIT_REFILL));
+        return ADMIN_CREDIT_REFILL;
+    }
+
+    return availableCredits;
+};
+
 const extractDate = (message) => {
     const regex = /\b(\d{1,2})[\/-](\d{1,2})[\/-](\d{2}|\d{4})\b/;
 
@@ -176,7 +198,7 @@ export const runAnalyzeImage = async (base64Image, phone, name, overrideMime = n
             ? String(overrideMime).toLowerCase()
             : detectMimeFromBase64(base64Image);
 
-        const availableCredits = await getWhatsappCredit();
+        const availableCredits = await ensureAvailableCredits();
 
         defaultLogger.info('Verificando créditos para consulta', {
             userId,
@@ -403,7 +425,7 @@ export const run = async (name, history, question, phone,imageBase64 = "") => {
     const numberPhone = phone;
 
     try {
-        const availableCredits = await getWhatsappCredit();
+        const availableCredits = await ensureAvailableCredits();
 
         defaultLogger.info('Verificando créditos para consulta', {
             userId,
@@ -499,7 +521,7 @@ export const runDetermine = async (history, phone) => {
     const name = '';
 
     try {
-        const availableCredits = await getWhatsappCredit();
+        const availableCredits = await ensureAvailableCredits();
 
         defaultLogger.info('Verificando créditos para determinación', {
             userId,
