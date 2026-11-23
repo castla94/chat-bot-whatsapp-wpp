@@ -1,557 +1,478 @@
+import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
+import { unmarshall } from "@aws-sdk/util-dynamodb";
 
-import {
-  DynamoDBClient,
-  GetItemCommand,
-  UpdateItemCommand
-} from "@aws-sdk/client-dynamodb";
+const dynamoDBClient = new DynamoDBClient({ region: "us-east-1" });
 
-// ==========================================
-// CONFIGURACION
-// ==========================================
+const WHATSAPP_TABLE = String(process.env.WHATSAPP_CONVERSATION_TABLE || "whatsapp_conversation").trim();
+const INSTAGRAM_TABLE = String(process.env.INSTAGRAM_CHAT_TABLE || "instagram_chat").trim();
+const MESSENGER_TABLE = String(process.env.MESSENGER_CHAT_TABLE || "messenger_chat").trim();
+const INSTAGRAM_SESSIONS_TABLE = String(process.env.INSTAGRAM_SESSIONS_TABLE || "instagram_sessions").trim();
+const MESSENGER_SESSIONS_TABLE = String(process.env.MESSENGER_SESSIONS_TABLE || "messenger_sessions").trim();
+const WIDGET_GUESTS_TABLE = String(process.env.WIDGET_GUESTS_TABLE || "chatbot-widget-guests").trim();
+const WIDGET_MESSAGES_TABLE = String(process.env.WIDGET_MESSAGES_TABLE || "chatbot-widget-messages").trim();
 
-const SHEET_ID =
-  "1EhGL30R8wgYD85QB49Cqbdx_6p0XSwjRV9eScIZRq0Q";
+const response = (statusCode, body) => ({
+  statusCode,
+  headers: {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "GET,OPTIONS"
+  },
+  body: JSON.stringify(body)
+});
 
-const SHEET_GID = process.env.SHEET_GID || "68254101";
-
-const TABLE_NAME = "whatsapp_prompt";
-const PK_NAME = "email";
-const PK_VALUE = "sepriovitalca@gmail.com";
-
-const MAX_MARKDOWN_BYTES = 350000;
-
-// Estructura del markdown
-const PRODUCT_COLUMN = "Producto"; // columna 2: producto (agrupación)
-const MODEL_COLUMN = "Modelo"; // columna 3: modelo (agrupación)
-const COLOR_COLUMN = "Color";
-const SIZE_COLUMN = "Talla";
-const STOCK_COLUMN = "Disponible";
-const LINK_COLUMN =
-  "Imagen referencial del producto (enlace de WhatsApp)";
-const SKIP_COLUMN = "SKU"; // columna 1: no se lee
-const IGNORED_COLUMNS = ["Descripción del producto"]; // columnas que no se muestran
-
-// Etiquetas legibles para los encabezados de la hoja
-const HEADER_LABELS = {
-  "Precio divisas (USD)": "Precio en divisas",
-  "Precio a tasa BCV (ref. USD)": "Precio normal en dólares"
+const getFirstString = (obj, keys) => {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
 };
 
-// Valores vacíos o de marcador que no deben aparecer
-const PLACEHOLDERS = [
-  "no registra informacion",
-  "sin informacion",
-  "no aplica",
-  "n/a",
-  "na",
-  "-"
-];
-
-const dynamodb = new DynamoDBClient({});
-
-// ==========================================
-// UTILIDADES
-// ==========================================
-
-function clean(value) {
-  return String(value ?? "")
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function isPlaceholder(value) {
-  return PLACEHOLDERS.includes(
-    clean(value).toLowerCase()
-  );
-}
-
-function response(statusCode, data) {
-  return {
-    statusCode,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8"
-    },
-    body: JSON.stringify(data)
-  };
-}
-
-// ==========================================
-// LEER CSV DE GOOGLE SHEETS
-// ==========================================
-
-function parseCSV(text) {
-  text = text.replace(/^\uFEFF/, "");
-
-  const rows = [];
-  let row = [];
-  let field = "";
-  let quoted = false;
-
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-
-    if (quoted) {
-      if (char === '"' && text[i + 1] === '"') {
-        field += '"';
-        i++;
-      } else if (char === '"') {
-        quoted = false;
-      } else {
-        field += char;
-      }
-
-      continue;
-    }
-
-    if (char === '"') {
-      quoted = true;
-    } else if (char === ",") {
-      row.push(field);
-      field = "";
-    } else if (char === "\n") {
-      row.push(field);
-      rows.push(row);
-      row = [];
-      field = "";
-    } else if (char !== "\r") {
-      field += char;
-    }
-  }
-
-  if (quoted) {
-    throw new Error("CSV inválido");
-  }
-
-  if (row.length || field !== "") {
-    row.push(field);
-    rows.push(row);
-  }
-
-  return rows;
-}
-
-// ==========================================
-// OBTENER HEADERS Y FILAS DE LA HOJA
-// ==========================================
-
-async function getSheetData() {
-  const url =
-    `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHEET_GID}`;
-
-  const res = await fetch(url, {
-    method: "GET",
-    redirect: "follow",
-    headers: {
-      Accept: "text/csv"
-    },
-    signal: AbortSignal.timeout(30000)
-  });
-
-  if (!res.ok) {
-    throw new Error(
-      `Google Sheets HTTP ${res.status}`
-    );
-  }
-
-  const csv = await res.text();
-
-  if (
-    csv.length > 5000000 ||
-    /<html|<!doctype html/i.test(
-      csv.slice(0, 500)
-    )
-  ) {
-    throw new Error(
-      "Google Sheets no devolvió CSV válido"
-    );
-  }
-
-  const table = parseCSV(csv).filter(row =>
-    row.some(cell => clean(cell) !== "")
-  );
-
-  if (table.length < 2) {
-    throw new Error(
-      "Google Sheets vacío o sin filas de datos"
-    );
-  }
-
-  const headers = table[0].map(header =>
-    clean(header)
-  );
-
-  const rows = table.slice(1).map(row => {
-    const item = {};
-
-    headers.forEach((header, index) => {
-      item[header] = clean(row[index]);
-    });
-
-    return item;
-  });
-
-  console.log(
-    "Headers Google Sheets:",
-    JSON.stringify(headers)
-  );
-
-  console.log(
-    "Filas Google Sheets:",
-    rows.length
-  );
-
-  return { headers, rows };
-}
-
-// ==========================================
-// GENERAR STRING MARKDOWN
-// ==========================================
-
-// Primer valor no vacío de una columna
-function firstValue(rows, column) {
-  for (const row of rows) {
-    const value = row[column];
-
-    if (value && !isPlaceholder(value))
-      return value;
-  }
-
-  return "";
-}
-
-function buildMarkdown(headers, rows) {
-  // Agrupar por Producto (columna B) y Modelo (columna C)
-  const groups = new Map();
-
-  // Columnas que no se listan como datos simples
-  const structuralColumns = new Set([
-    PRODUCT_COLUMN,
-    MODEL_COLUMN,
-    COLOR_COLUMN,
-    SIZE_COLUMN,
-    STOCK_COLUMN,
-    LINK_COLUMN,
-    SKIP_COLUMN,
-    ...IGNORED_COLUMNS
-  ]);
-
-  for (const row of rows) {
-    const product =
-      row[PRODUCT_COLUMN] || "SIN PRODUCTO";
-
-    const model =
-      row[MODEL_COLUMN] || "";
-
-    if (!groups.has(product))
-      groups.set(product, new Map());
-
-    const models = groups.get(product);
-
-    if (!models.has(model))
-      models.set(model, []);
-
-    models.get(model).push(row);
-  }
-
-  const lines = [
-    "## INFORMACIÓN DEL CATÁLOGO",
-    "",
-    "- Los datos provienen del inventario en Google Sheets.",
-    "- No inventar productos, precios ni características.",
-    "- «Precio en divisas»: aplica a Binance y a dólares en efectivo; no se indica en bolívares.",
-    "- «Precio normal en dólares»: aplica a Pago Móvil y Transferencia.",
-    ""
-  ];
-
-  for (
-    const product of [...groups.keys()]
-      .sort((a, b) => a.localeCompare(b, "es"))
-  ) {
-    lines.push(`## ${product}`, "");
-
-    const models = groups.get(product);
-
-    for (
-      const model of [...models.keys()]
-        .sort((a, b) => a.localeCompare(b, "es"))
-    ) {
-      const items = models.get(model);
-
-      // Solo se crea el subtítulo cuando hay modelo;
-      // si no, la ficha queda bajo el producto.
-      if (model)
-        lines.push(`### ${model}`);
-
-      // Disponibilidad desglosada por color y talla
-      const stock = new Map();
-
-      for (const row of items) {
-        const color =
-          row[COLOR_COLUMN] || "Sin color";
-
-        if (!stock.has(color))
-          stock.set(color, []);
-
-        stock.get(color).push({
-          size: row[SIZE_COLUMN] || "",
-          qty: row[STOCK_COLUMN] || "0"
-        });
-      }
-
-      if (stock.size) {
-        lines.push(
-          "- Disponibilidad (color/talla):"
-        );
-
-        for (
-          const color of [...stock.keys()]
-            .sort((a, b) =>
-              a.localeCompare(b, "es")
-            )
-        ) {
-          const entries = stock
-            .get(color)
-            .sort((a, b) =>
-              a.size.localeCompare(b.size, "es", {
-                numeric: true
-              })
-            )
-            .map(entry =>
-              entry.size
-                ? `${entry.size} (${entry.qty})`
-                : entry.qty
-            );
-
-          lines.push(
-            `  - ${color}: ${entries.join(", ")}`
-          );
-        }
-      }
-
-      // Enlaces por color (cada modelo+color con su link,
-      // dentro de una sola ficha de producto + modelo)
-      const linksByColor = new Map();
-
-      for (const row of items) {
-        const link = row[LINK_COLUMN];
-
-        if (!link || isPlaceholder(link))
-          continue;
-
-        const color = row[COLOR_COLUMN] || "";
-
-        if (!linksByColor.has(color))
-          linksByColor.set(color, new Set());
-
-        linksByColor.get(color).add(link);
-      }
-
-      if (linksByColor.size) {
-        // Sin variantes de color: link directo
-        if (linksByColor.size === 1 && linksByColor.has("")) {
-          lines.push(
-            `- imagen: ${[...linksByColor.get("")].join(" | ")}`
-          );
-        } else {
-          lines.push("- imagen:");
-
-          for (
-            const color of [...linksByColor.keys()]
-              .sort((a, b) =>
-                a.localeCompare(b, "es")
-              )
-          ) {
-            lines.push(
-              `  - ${color || model || product}: ${[...linksByColor.get(color)].join(" | ")}`
-            );
-          }
-        }
-      }
-
-      // Datos compartidos del modelo
-      for (const header of headers) {
-        if (structuralColumns.has(header))
-          continue;
-
-        const value = firstValue(
-          items,
-          header
-        );
-
-        if (!value)
-          continue;
-
-        const label =
-          HEADER_LABELS[header] || header;
-
-        lines.push(`- ${label}: ${value}`);
-      }
-
-      lines.push("");
-    }
-  }
-
-  return lines.join("\n").trim();
-}
-
-// ==========================================
-// DYNAMODB GETITEM
-// ==========================================
-
-async function getPromptItem() {
-  const data = await dynamodb.send(
-    new GetItemCommand({
-      TableName: TABLE_NAME,
-      Key: {
-        [PK_NAME]: { S: PK_VALUE }
-      },
-      ConsistentRead: true
-    })
-  );
-
-  if (!data.Item) {
-    throw new Error(
-      `No existe ${PK_VALUE} en ${TABLE_NAME}`
-    );
-  }
-
-  return data.Item;
-}
-
-// ==========================================
-// DYNAMODB UPDATE SOLO PRODUCTS
-// ==========================================
-
-async function updateProducts(markdown) {
-  await dynamodb.send(
-    new UpdateItemCommand({
-      TableName: TABLE_NAME,
-      Key: {
-        [PK_NAME]: { S: PK_VALUE }
-      },
-      UpdateExpression:
-        "SET #products = :value",
-      ConditionExpression:
-        "attribute_exists(#pk)",
-      ExpressionAttributeNames: {
-        "#products": "products",
-        "#pk": PK_NAME
-      },
-      ExpressionAttributeValues: {
-        ":value": { S: markdown }
-      },
-      ReturnValues: "NONE"
-    })
-  );
-}
-
-// ==========================================
-// LAMBDA HANDLER
-// ==========================================
-
-export const handler = async (
-  event = {},
-  context
-) => {
+const isMissingKeySchemaElementError = (error, keyName) =>
+  String(error?.message || "").includes(`Query condition missed key schema element: ${keyName}`);
+
+const queryAllByEmail = async ({ tableName, email, maxItems, dateRange }) => {
+  let startKey = undefined;
+  let collected = [];
   try {
-    const input =
-      typeof event.body === "string"
-        ? JSON.parse(event.body || "{}")
-        : event.body &&
-          typeof event.body === "object"
-          ? event.body
-          : event;
-
-    const dryRun = input?.dryRun === true;
-
-    console.log(
-      "Iniciando sincronización desde Google Sheets"
-    );
-
-    // 1. VERIFICAR REGISTRO
-
-    await getPromptItem();
-
-    // 2. LEER HEADERS Y FILAS DE GOOGLE SHEETS
-
-    const { headers, rows } =
-      await getSheetData();
-
-    if (!rows.length) {
-      throw new Error(
-        "Google Sheets sin filas de datos"
-      );
+    while (true) {
+      const params = {
+        TableName: tableName,
+        KeyConditionExpression: "#email = :email",
+        ExpressionAttributeNames: { "#email": "email" },
+        ExpressionAttributeValues: { ":email": { S: email } },
+        ExclusiveStartKey: startKey,
+        Limit: 200
+      };
+      // Filtra el mes en DynamoDB para no traer todo el histórico (evita el 413).
+      if (dateRange) {
+        params.FilterExpression = "#ts BETWEEN :rangeStart AND :rangeEnd";
+        params.ExpressionAttributeNames["#ts"] = dateRange.attribute;
+        params.ExpressionAttributeValues[":rangeStart"] = { S: dateRange.startIso };
+        params.ExpressionAttributeValues[":rangeEnd"] = { S: dateRange.endIso };
+      }
+      const res = await dynamoDBClient.send(new QueryCommand(params));
+      const items = Array.isArray(res?.Items) ? res.Items.map((i) => unmarshall(i)) : [];
+      collected = collected.concat(items);
+      if (collected.length > maxItems) {
+        console.error("Consulta por email superó el máximo de items", {
+          tableName,
+          email,
+          maxItems,
+          collected: collected.length,
+          monthScoped: Boolean(dateRange)
+        });
+        return { ok: false, error: "TOO_MANY_ITEMS", items: [] };
+      }
+      startKey = res?.LastEvaluatedKey;
+      if (!startKey) break;
     }
-
-    // 3. GENERAR MARKDOWN
-
-    const markdown = buildMarkdown(
-      headers,
-      rows
-    );
-
-    const bytes = Buffer.byteLength(
-      markdown,
-      "utf8"
-    );
-
-    // 4. IMPRIMIR RESULTADO EN LOGS
-
-    console.log("Markdown generado:");
-    console.log(markdown);
-
-    console.log({
-      total_filas: rows.length,
-      markdown_bytes: bytes
+  } catch (error) {
+    console.error("Error consultando tabla por email", {
+      tableName,
+      email,
+      message: error?.message || String(error)
     });
+    throw error;
+  }
+  return { ok: true, items: collected };
+};
 
-    // 5. VALIDAR TAMAÑO
-
-    if (bytes > MAX_MARKDOWN_BYTES) {
-      throw new Error(
-        `Markdown demasiado grande: ${bytes} bytes`
+const queryAllBySenderId = async ({ tableName, senderId, email, maxItems, dateRange }) => {
+  let startKey = undefined;
+  let collected = [];
+  try {
+    while (true) {
+      const expressionNames = {
+        "#senderId": "senderId",
+        "#email": "email"
+      };
+      const expressionValues = {
+        ":senderId": { S: senderId },
+        ":email": { S: email }
+      };
+      // `timestamp` es la sort key de la tabla: el rango temporal debe ir en la
+      // KeyConditionExpression (DynamoDB no permite keys en el FilterExpression).
+      let keyConditionExpression = "#senderId = :senderId";
+      const filterExpression = "#email = :email";
+      // Filtra el mes en DynamoDB para no traer todo el histórico (evita el 413).
+      if (dateRange) {
+        keyConditionExpression += " AND #ts BETWEEN :rangeStart AND :rangeEnd";
+        expressionNames["#ts"] = dateRange.attribute;
+        expressionValues[":rangeStart"] = { S: dateRange.startIso };
+        expressionValues[":rangeEnd"] = { S: dateRange.endIso };
+      }
+      const res = await dynamoDBClient.send(
+        new QueryCommand({
+          TableName: tableName,
+          KeyConditionExpression: keyConditionExpression,
+          FilterExpression: filterExpression,
+          ExpressionAttributeNames: expressionNames,
+          ExpressionAttributeValues: expressionValues,
+          ExclusiveStartKey: startKey,
+          Limit: 200
+        })
       );
+      const items = Array.isArray(res?.Items) ? res.Items.map((i) => unmarshall(i)) : [];
+      collected = collected.concat(items);
+      if (collected.length > maxItems) {
+        console.error("Consulta por senderId superó el máximo de items", {
+          tableName,
+          senderId,
+          email,
+          maxItems,
+          collected: collected.length,
+          monthScoped: Boolean(dateRange)
+        });
+        return { ok: false, error: "TOO_MANY_ITEMS", items: [] };
+      }
+      startKey = res?.LastEvaluatedKey;
+      if (!startKey) break;
     }
+  } catch (error) {
+    console.error("Error consultando tabla por senderId", {
+      tableName,
+      senderId,
+      email,
+      message: error?.message || String(error)
+    });
+    throw error;
+  }
+  return { ok: true, items: collected };
+};
 
-    // 6. MODO PRUEBA
+const queryWidgetMessagesBySessionIdAndCreatedAt = async ({ sessionId, startIso, endIso, maxItems }) => {
+  if (!WIDGET_MESSAGES_TABLE) return { ok: true, items: [] };
+  let startKey = undefined;
+  let collected = [];
+  try {
+    while (true) {
+      const res = await dynamoDBClient.send(
+        new QueryCommand({
+          TableName: WIDGET_MESSAGES_TABLE,
+          KeyConditionExpression: "#sessionId = :sessionId",
+          FilterExpression: "#createdAt BETWEEN :start AND :end",
+          ExpressionAttributeNames: { "#sessionId": "session_id", "#createdAt": "created_at", "#role": "role" },
+          ExpressionAttributeValues: { ":sessionId": { S: sessionId }, ":start": { S: startIso }, ":end": { S: endIso } },
+          ProjectionExpression: "#createdAt, guest_id, #role",
+          ExclusiveStartKey: startKey,
+          Limit: 200
+        })
+      );
+      const items = Array.isArray(res?.Items) ? res.Items.map((i) => unmarshall(i)) : [];
+      collected = collected.concat(items);
+      if (collected.length > maxItems) return { ok: false, error: "TOO_MANY_ITEMS", items: [] };
+      startKey = res?.LastEvaluatedKey;
+      if (!startKey) break;
+    }
+  } catch (error) {
+    console.error("Error consultando mensajes web por session_id", {
+      tableName: WIDGET_MESSAGES_TABLE,
+      sessionId,
+      startIso,
+      endIso,
+      message: error?.message || String(error)
+    });
+    throw error;
+  }
 
-    if (dryRun) {
-      return response(200, {
-        success: true,
-        dryRun: true,
-        total_filas: rows.length,
-        markdown_bytes: bytes,
-        preview: markdown.slice(0, 10000)
+  return { ok: true, items: collected };
+};
+
+export const handler = async (event) => {
+  const method = String(event?.requestContext?.http?.method || event?.httpMethod || "").toUpperCase();
+  if (method === "OPTIONS") return response(204, "");
+
+  const emailRaw = String(event?.queryStringParameters?.email || "").trim().toLowerCase();
+  if (!emailRaw) return response(400, { ok: false, error: "MISSING_EMAIL" });
+  const debug = String(event?.queryStringParameters?.debug || "").trim() === "1";
+
+  try {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+    const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+    // Rango del mes actual para filtrar en DynamoDB (los timestamps se guardan en ISO UTC).
+    const monthRange = {
+      attribute: "timestamp",
+      startIso: startOfMonth.toISOString(),
+      endIso: endOfMonth.toISOString()
+    };
+
+    const chartData = Array.from({ length: daysInMonth }, (_, i) => ({
+      dia: String(i + 1).padStart(2, "0"),
+      mensajes: 0,
+      usuariosActivos: 0,
+      mensajesWhatsapp: 0,
+      usuariosWhatsapp: 0,
+      mensajesInstagram: 0,
+      usuariosInstagram: 0,
+      mensajesMessenger: 0,
+      usuariosMessenger: 0,
+      mensajesWeb: 0,
+      usuariosWeb: 0
+    }));
+
+    const uniqueWhatsappUsersByDay = new Array(daysInMonth).fill(null).map(() => new Set());
+    const uniqueInstagramUsersByDay = new Array(daysInMonth).fill(null).map(() => new Set());
+    const uniqueMessengerUsersByDay = new Array(daysInMonth).fill(null).map(() => new Set());
+    const uniqueWebUsersByDay = new Array(daysInMonth).fill(null).map(() => new Set());
+
+    const whatsappMonthUsers = new Set();
+    const instagramMonthUsers = new Set();
+    const messengerMonthUsers = new Set();
+
+    let whatsappMessages = 0;
+    let instagramMessages = 0;
+    let messengerMessages = 0;
+
+    if (WHATSAPP_TABLE) {
+      const waRes = await queryAllByEmail({
+        tableName: WHATSAPP_TABLE,
+        email: emailRaw,
+        maxItems: 20000,
+        dateRange: monthRange
       });
+      if (!waRes.ok) return response(413, { ok: false, error: waRes.error });
+      for (const item of waRes.items) {
+        const ts = getFirstString(item, ["timestamp", "created_at", "time"]);
+        const phoneRaw = getFirstString(item, ["phone", "from", "number"]);
+        if (!ts || !phoneRaw) continue;
+        const dt = new Date(ts);
+        if (dt < startOfMonth || dt > endOfMonth) continue;
+        const dayIndex = dt.getDate() - 1;
+        if (dayIndex < 0 || dayIndex >= daysInMonth) continue;
+        whatsappMessages += 1;
+        chartData[dayIndex].mensajes += 1;
+        chartData[dayIndex].mensajesWhatsapp += 1;
+        const phone = String(phoneRaw).split("_")[0] || phoneRaw;
+        if (phone) whatsappMonthUsers.add(phone);
+        if (phone && !uniqueWhatsappUsersByDay[dayIndex].has(phone)) {
+          uniqueWhatsappUsersByDay[dayIndex].add(phone);
+          chartData[dayIndex].usuariosActivos += 1;
+          chartData[dayIndex].usuariosWhatsapp += 1;
+        }
+      }
     }
 
-    // 7. ACTUALIZAR SOLO PRODUCTS
+    if (INSTAGRAM_TABLE) {
+      const instagramSessionsRes = await queryAllByEmail({
+        tableName: INSTAGRAM_SESSIONS_TABLE,
+        email: emailRaw,
+        maxItems: 5000,
+        dateRange: monthRange
+      });
+      if (!instagramSessionsRes.ok) return response(413, { ok: false, error: instagramSessionsRes.error });
 
-    await updateProducts(markdown);
+      const instagramSenderIds = [
+        ...new Set(
+          instagramSessionsRes.items
+            .map((item) => getFirstString(item, ["senderId", "sender_id", "from", "user_id", "uid"]))
+            .filter(Boolean)
+        )
+      ];
+
+      for (const senderId of instagramSenderIds) {
+        const igRes = await queryAllBySenderId({
+          tableName: INSTAGRAM_TABLE,
+          senderId,
+          email: emailRaw,
+          maxItems: 2000,
+          dateRange: monthRange
+        });
+        if (!igRes.ok) return response(413, { ok: false, error: igRes.error });
+        for (const item of igRes.items) {
+        const ts = getFirstString(item, ["timestamp", "created_at", "time"]);
+        if (!ts || !senderId) continue;
+        const dt = new Date(ts);
+        if (dt < startOfMonth || dt > endOfMonth) continue;
+        const dayIndex = dt.getDate() - 1;
+        if (dayIndex < 0 || dayIndex >= daysInMonth) continue;
+        instagramMessages += 1;
+        chartData[dayIndex].mensajes += 1;
+        chartData[dayIndex].mensajesInstagram += 1;
+        instagramMonthUsers.add(senderId);
+        if (!uniqueInstagramUsersByDay[dayIndex].has(senderId)) {
+          uniqueInstagramUsersByDay[dayIndex].add(senderId);
+          chartData[dayIndex].usuariosActivos += 1;
+          chartData[dayIndex].usuariosInstagram += 1;
+        }
+      }
+      }
+    }
+
+    if (MESSENGER_TABLE) {
+      const messengerSessionsRes = await queryAllByEmail({
+        tableName: MESSENGER_SESSIONS_TABLE,
+        email: emailRaw,
+        maxItems: 5000,
+        dateRange: monthRange
+      });
+      if (!messengerSessionsRes.ok) return response(413, { ok: false, error: messengerSessionsRes.error });
+
+      const messengerSenderIds = [
+        ...new Set(
+          messengerSessionsRes.items
+            .map((item) => getFirstString(item, ["senderId", "sender_id", "from", "user_id", "uid"]))
+            .filter(Boolean)
+        )
+      ];
+
+      for (const senderId of messengerSenderIds) {
+        const messengerRes = await queryAllBySenderId({
+          tableName: MESSENGER_TABLE,
+          senderId,
+          email: emailRaw,
+          maxItems: 2000,
+          dateRange: monthRange
+        });
+        if (!messengerRes.ok) return response(413, { ok: false, error: messengerRes.error });
+        for (const item of messengerRes.items) {
+        const ts = getFirstString(item, ["timestamp", "created_at", "time"]);
+        if (!ts || !senderId) continue;
+        const dt = new Date(ts);
+        if (dt < startOfMonth || dt > endOfMonth) continue;
+        const dayIndex = dt.getDate() - 1;
+        if (dayIndex < 0 || dayIndex >= daysInMonth) continue;
+        messengerMessages += 1;
+        chartData[dayIndex].mensajes += 1;
+        chartData[dayIndex].mensajesMessenger += 1;
+        messengerMonthUsers.add(senderId);
+        if (!uniqueMessengerUsersByDay[dayIndex].has(senderId)) {
+          uniqueMessengerUsersByDay[dayIndex].add(senderId);
+          chartData[dayIndex].usuariosActivos += 1;
+          chartData[dayIndex].usuariosMessenger += 1;
+        }
+      }
+      }
+    }
+
+    let webUsers = 0;
+    let webMessages = 0;
+    let webMessagesMonthItemsCount = 0;
+    let webSessionIds = [];
+
+    if (WIDGET_GUESTS_TABLE) {
+        try {
+          const guestsRes = await queryAllByEmail({ tableName: WIDGET_GUESTS_TABLE, email: emailRaw, maxItems: 5000 });
+          if (guestsRes.ok) {
+            const uniqueGuests = new Set();
+            const debugMeta = debug ? { guests_total: guestsRes.items.length, guests_with_guest_id: 0 } : null;
+            for (const g of guestsRes.items) {
+              const guestId = getFirstString(g, ["guest_id"]);
+              if (!guestId) continue;
+              if (debugMeta) debugMeta.guests_with_guest_id += 1;
+              uniqueGuests.add(guestId);
+            }
+            webSessionIds = [
+              ...new Set(
+                guestsRes.items
+                  .map((item) => getFirstString(item, ["session_id", "sessionId"]))
+                  .filter(Boolean)
+              )
+            ];
+            webUsers = uniqueGuests.size;
+            if (debugMeta) {
+              webUsers = uniqueGuests.size;
+              if (!event.__debug_meta) event.__debug_meta = {};
+              event.__debug_meta.web_guests = debugMeta;
+              event.__debug_meta.web_sessions = { session_ids: webSessionIds.length };
+            }
+        }
+        } catch (error) {
+          console.error("No se pudo calcular webUsers desde widget guests", {
+            tableName: WIDGET_GUESTS_TABLE,
+            email: emailRaw,
+            message: error?.message || String(error)
+          });
+          if (!isMissingKeySchemaElementError(error, "email") && !isMissingKeySchemaElementError(error, "session_id")) {
+            throw error;
+          }
+      }
+    }
+
+    if (WIDGET_MESSAGES_TABLE) {
+      const startIso = startOfMonth.toISOString();
+      const endIso = endOfMonth.toISOString();
+        try {
+          if (!webSessionIds.length) {
+            console.error("No se encontraron session_id para consultar widget messages", {
+              tableName: WIDGET_MESSAGES_TABLE,
+              email: emailRaw
+            });
+          } else {
+            for (const sessionId of webSessionIds) {
+              const webMsgRes = await queryWidgetMessagesBySessionIdAndCreatedAt({
+                sessionId,
+                startIso,
+                endIso,
+                maxItems: 5000
+              });
+              if (!webMsgRes.ok) return response(413, { ok: false, error: webMsgRes.error });
+              webMessagesMonthItemsCount += webMsgRes.items.length;
+              for (const m of webMsgRes.items) {
+                const createdAt = getFirstString(m, ["created_at"]);
+                if (!createdAt) continue;
+                const dt = new Date(createdAt);
+                if (dt < startOfMonth || dt > endOfMonth) continue;
+                const dayIndex = dt.getDate() - 1;
+                if (dayIndex < 0 || dayIndex >= daysInMonth) continue;
+                webMessages += 1;
+                chartData[dayIndex].mensajes += 1;
+                chartData[dayIndex].mensajesWeb += 1;
+
+                const role = getFirstString(m, ["role"]);
+                if (role !== "user") continue;
+                const gid = getFirstString(m, ["guest_id"]);
+                if (!gid) continue;
+                if (!uniqueWebUsersByDay[dayIndex].has(gid)) {
+                  uniqueWebUsersByDay[dayIndex].add(gid);
+                  chartData[dayIndex].usuariosActivos += 1;
+                  chartData[dayIndex].usuariosWeb += 1;
+                }
+              }
+            }
+        }
+        } catch (error) {
+          console.error("No se pudo calcular webMessages desde widget messages", {
+            tableName: WIDGET_MESSAGES_TABLE,
+            email: emailRaw,
+            startIso,
+            endIso,
+            message: error?.message || String(error)
+          });
+          if (!isMissingKeySchemaElementError(error, "email") && !isMissingKeySchemaElementError(error, "session_id")) {
+            throw error;
+          }
+      }
+    }
 
     return response(200, {
-      success: true,
-      table: TABLE_NAME,
-      pk: PK_VALUE,
-      updated_field: "products",
-      total_filas: rows.length,
-      markdown_bytes: bytes,
-      message:
-        "Catálogo actualizado correctamente"
+      ok: true,
+      whatsappUsers: whatsappMonthUsers.size,
+      whatsappMessages,
+      instagramUsers: instagramMonthUsers.size,
+      instagramMessages,
+      messengerUsers: messengerMonthUsers.size,
+      messengerMessages,
+      webUsers,
+      webMessages,
+      chartData,
+      ...(debug
+        ? {
+            debug: {
+              ...(event.__debug_meta || {}),
+              web_messages_query: { items: webMessagesMonthItemsCount }
+            }
+          }
+        : {})
     });
-
   } catch (error) {
-    console.error(error);
-
-    return response(500, {
-      success: false,
-      table: TABLE_NAME,
-      pk: PK_VALUE,
-      updated_field: "products",
-      message:
-        "No fue posible completar la sincronización",
-      error: error.message
-    });
+      console.error("Error generando reporte de metricas", {
+        email: emailRaw,
+        message: error?.message || String(error)
+      });
+    return response(500, { ok: false, error: "INTERNAL_ERROR", detail: String(error?.message || "Unknown error") });
   }
 };

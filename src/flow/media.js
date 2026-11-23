@@ -1,3 +1,4 @@
+import { splitMobilePayment } from '../helpers/paymentMessages.js'
 import { run, runUpdatePromptServicesProduct } from '../services/openai/index.js';
 import {
     getWhatsappConversation,
@@ -1170,7 +1171,9 @@ const respondAndFinalize = async ({
     pathImg
 }) => {
     // Procesar orden "datos recibidos" (PRIMERO. Predomina sobre alarma.)
+    let messages = [response]
     if (response.toLowerCase().includes("datos recibidos")) {
+        messages = splitMobilePayment(response)
         const whatsappPrompt = await promptGetWhatsapp(combinedMessages);
         if (whatsappPrompt.products_dynamic) {
             const updatePrompt = await runUpdatePromptServicesProduct(response);
@@ -1216,10 +1219,12 @@ const respondAndFinalize = async ({
         file: 'media.js'
     })
 
-    if (numberPhone.length <= 11) {
-        await provider.sendMessage(numberPhone, response, { media: null })
-    } else {
-        await flowDynamic(response)
+    for (const message of messages) {
+        if (numberPhone.length <= 11) {
+            await provider.sendMessage(numberPhone, message, { media: null })
+        } else {
+            await flowDynamic(message)
+        }
     }
 
     // Actualizar historial

@@ -1,3 +1,4 @@
+import { splitMobilePayment } from '../helpers/paymentMessages.js'
 import { handlerAI } from "../services/audio/index.js"
 import { run, runUpdatePromptServicesProduct } from '../services/openai/index.js'
 import {
@@ -541,7 +542,9 @@ const respondAndFinalize = async (response, combinedMessages, name, numberPhone,
     }
 
     // Procesar orden "datos recibidos"
+    let messages = [response]
     if (response.toLowerCase().includes("datos recibidos")) {
+        messages = splitMobilePayment(response)
         const whatsappPrompt = await promptGetWhatsapp(combinedMessages);
         if (whatsappPrompt.products_dynamic) {
             const updatePrompt = await runUpdatePromptServicesProduct(response);
@@ -577,10 +580,12 @@ const respondAndFinalize = async (response, combinedMessages, name, numberPhone,
         file: 'voice.js'
     })
 
-    if (numberPhone.length <= 11) {
-        await provider.sendMessage(numberPhone, response, { media: null })
-    } else {
-        await flowDynamic(response)
+    for (const message of messages) {
+        if (numberPhone.length <= 11) {
+            await provider.sendMessage(numberPhone, message, { media: null })
+        } else {
+            await flowDynamic(message)
+        }
     }
 
     if (newHistory.length === 0 || newHistory[newHistory.length - 1].role !== 'user' || newHistory[newHistory.length - 1].content !== combinedMessages) {

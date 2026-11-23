@@ -14,6 +14,7 @@ let server;
 let stopping = false;
 const processStartedAt = Date.now();
 const qrPath = path.resolve(__dirname, '../bot.qr.png');
+let loadingScreenReported = false;
 
 function clearQr() {
   try {
@@ -95,6 +96,13 @@ async function main() {
       } catch (error) {
         console.error('No se pudo guardar la imagen QR:', error.message);
       }
+    },
+    // Primer evento de la pantalla de carga de WhatsApp Web: separa el tiempo de
+    // lanzar Chromium y abrir la página del boot del propio WhatsApp Web.
+    onLoadingScreen: (percent, message) => {
+      if (loadingScreenReported) return;
+      loadingScreenReported = true;
+      console.log(`WhatsApp Web empezó a renderizar (+${Date.now() - processStartedAt} ms). Progreso: ${percent}% ${message || ''}`.trim());
     },
     disableWelcome: true,
     ...(config.browserPath && {

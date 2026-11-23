@@ -1,3 +1,4 @@
+import { splitMobilePayment } from '../helpers/paymentMessages.js'
 import { run, runUpdatePromptServicesProduct } from '../services/openai/index.js'
 import {
     getWhatsapp,
@@ -606,7 +607,9 @@ const respondAndFinalize = async (response, combinedMessages, name, numberPhone,
     }
 
     // Procesar orden "datos recibidos"
+    let messages = [response]
     if (response.toLowerCase().includes("datos recibidos")) {
+        messages = splitMobilePayment(response)
         const whatsappPrompt = await promptGetWhatsapp(combinedMessages);
         if (whatsappPrompt.products_dynamic) {
             const updatePrompt = await runUpdatePromptServicesProduct(response);
@@ -651,18 +654,20 @@ const respondAndFinalize = async (response, combinedMessages, name, numberPhone,
     })
 
     // Enviar respuesta
-    if (numberPhone.length <= 11) {
-        defaultLogger.info('Enviando chunk por provider.sendMessage', {
-            numberPhone, numberPhoneLength: numberPhone.length, chunk: response,
-            file: 'chatbot.js'
-        })
-        await provider.sendMessage(numberPhone, response, { media: null })
-    } else {
-        defaultLogger.info('Enviando chunk por flowDynamic', {
-            numberPhone, numberPhoneLength: numberPhone.length, chunk: response,
-            file: 'chatbot.js'
-        })
-        await flowDynamic(response)
+    for (const message of messages) {
+        if (numberPhone.length <= 11) {
+            defaultLogger.info('Enviando chunk por provider.sendMessage', {
+                numberPhone, numberPhoneLength: numberPhone.length, chunk: message,
+                file: 'chatbot.js'
+            })
+            await provider.sendMessage(numberPhone, message, { media: null })
+        } else {
+            defaultLogger.info('Enviando chunk por flowDynamic', {
+                numberPhone, numberPhoneLength: numberPhone.length, chunk: message,
+                file: 'chatbot.js'
+            })
+            await flowDynamic(message)
+        }
     }
 
     // Actualizar historial (role assistant)
