@@ -56,7 +56,6 @@ async function main() {
     session: config.session, sessionDirectory: config.folderNameToken,
     envFile: envPath,
     headless: config.headless, apiHost: config.apiHost, apiPort: config.apiPort,
-    insecureChromiumArgs: config.insecureChromiumArgs,
     silenceTextAudioSeconds: process.env.SILENCE_TEXT_AUDIO_SECONDS || '5',
     silenceImageSeconds: 45, model: 'gpt-5-mini',
     openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
@@ -75,7 +74,9 @@ async function main() {
     autoClose: config.autoClose,
     // Evita la consulta bloqueante al registro de npm al iniciar.
     updatesLog: false,
-    useInsecureChromiumArgs: config.insecureChromiumArgs,
+    // Flags optimizados para servidor (sin sandbox y con servicios en segundo
+    // plano reducidos). Reemplaza la lista por defecto de WPPConnect.
+    browserArgs: config.browserArgs,
     tokenStore: 'file',
     folderNameToken: config.folderNameToken,
     logQR: false,
