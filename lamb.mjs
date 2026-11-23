@@ -1,596 +1,557 @@
-// Importa las dependencias necesarias
-import { DynamoDBClient, PutItemCommand, ScanCommand, GetItemCommand, DeleteItemCommand } from "@aws-sdk/client-dynamodb";
-import { decrypt_object_id } from '/opt/aes256.mjs';
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
-import { unmarshall } from "@aws-sdk/util-dynamodb"; // Utilidad para convertir los datos
 
- 
-// Creamos el cliente S3
-const s3 = new S3Client({ region: 'us-east-1' });
-// Crea un cliente de DynamoDB
-const dynamoDBClient = new DynamoDBClient({ region: 'us-east-1' });
+import {
+  DynamoDBClient,
+  GetItemCommand,
+  UpdateItemCommand
+} from "@aws-sdk/client-dynamodb";
 
+// ==========================================
+// CONFIGURACION
+// ==========================================
 
-// Función Lambda handler
-export const handler = async (event) => {
+const SHEET_ID =
+  "1EhGL30R8wgYD85QB49Cqbdx_6p0XSwjRV9eScIZRq0Q";
 
- let port_set = 0;
+const SHEET_GID = process.env.SHEET_GID || "68254101";
 
- let emailEncrypt = event.queryStringParameters?.email;  // Conversión a string
- 
- let email_bk = event.queryStringParameters?.email_bk;  // Conversión a string
- 
- let pm2 = event.queryStringParameters?.pm2;  // Conversión a string
- 
-  console.log("queryStringParameters:",event.queryStringParameters)
- 
- let email = "";
- if(!emailEncrypt){
-   email = email_bk;
- }else{
-    email = decrypt_object_id(emailEncrypt);
- }
+const TABLE_NAME = "whatsapp_prompt";
+const PK_NAME = "email";
+const PK_VALUE = "sepriovitalca@gmail.com";
 
-  if (!email) {
-    return {
-       headers: {
-            "Access-Control-Allow-Origin": "*", // Or specify your domain
-            "Access-Control-Allow-Headers": "Content-Type",
-            "Access-Control-Allow-Methods": "POST"
-        },
-      statusCode: 400,
-      body: JSON.stringify({ message: 'email is a required query parameter' })
-    };
-  }
-  
-  const { credit,port,api,template = 'chat-bot-whatsapp' } =  JSON.parse(event.body);
+const MAX_MARKDOWN_BYTES = 350000;
 
+// Estructura del markdown
+const PRODUCT_COLUMN = "Producto"; // columna 2: producto (agrupación)
+const MODEL_COLUMN = "Modelo"; // columna 3: modelo (agrupación)
+const COLOR_COLUMN = "Color";
+const SIZE_COLUMN = "Talla";
+const STOCK_COLUMN = "Disponible";
+const LINK_COLUMN =
+  "Imagen referencial del producto (enlace de WhatsApp)";
+const SKIP_COLUMN = "SKU"; // columna 1: no se lee
+const IGNORED_COLUMNS = ["Descripción del producto"]; // columnas que no se muestran
 
-  
-  
-  const numericCredit = Number(credit);
-  const safeCredit = Number.isFinite(numericCredit) ? numericCredit : 0;
-  let free_try = safeCredit === 1;
-
-  console.log("request: ",{ email, credit: safeCredit, port, free_try })
-    
- let table_whatsapp_setting = "whatsapp_setting";
- let table_whatsapp_prompt = "whatsapp_prompt";
- let table_whatsapp_alarm = "whatsapp_alarm";
- let table_whatsapp_status = "whatsapp_status";
- let table_whatsapp_message = "whatsapp_message";
- let table_whatsapp_whitelist = "whatsapp_whitelist";
- let table_whatsapp_free_try = "whatsapp_free_try";
- let table_whatsapp_premiun = "whatsapp_premiun";
-
-  const field_prompt = await getTemplateFromS3();
-  
-  const params_prompt = {
-    TableName: table_whatsapp_prompt,
-    Item: {
-      email: { S: email },
-      prompt: { S: field_prompt.prompt.S },
-      name: { S: field_prompt.name.S },
-      description: { S: field_prompt.description.S },
-      products: { S: field_prompt.products.S },
-      format_order: { S: field_prompt.format_order.S },
-      instruccions_iteration: { S: field_prompt.instruccions_iteration.S },
-      goal: { S: field_prompt.goal.S },
-      s3_url_menu: { S: field_prompt.s3_url_menu.S },
-      how_responding_customer: { S: field_prompt.how_responding_customer.S },
-      welcome: { S: field_prompt.welcome.S },
-      tono: { S: field_prompt.tono.S },
-      timestamp: { S: new Date().toISOString() }
-    }
-  };
-  
-      console.log("table_whatsapp_prompt : ",table_whatsapp_prompt)
-
-  
-    const params_alarm = {
-    TableName: table_whatsapp_alarm,
-    Item: {
-      email: { S: email },
-      list_email: { S: email },
-      list_phone: { S: "" },
-      regex: { M: {} },
-      status_email: { BOOL: true },
-      status_phone: { BOOL: false },
-      timestamp: { S: new Date().toISOString() }
-    }
-  };
-  
-        console.log("params_alarm : ",params_alarm)
-
-
-  const params_status = {
-    TableName: table_whatsapp_status,
-    Item: {
-      email: { S: email },
-      start_time: { S: "09:00:00" },
-      end_time: { S: "21:00:00" },
-      status: { BOOL: true },
-      status_schedule: { BOOL: false },
-      timezone: { S: "" }
-    }
-  };
-  
-          console.log("params_status : ",params_status)
-
-  
-  const userName = getNameUser(email)
-
-  const params_message = {
-    TableName: table_whatsapp_message,
-    Item: {
-      email: { S: email },
-      url_history_message: { S: "http://44.194.126.224/clientes_chatbot/cliente_"+userName+"/sessions_history/" },
-      url_message: { S: "http://44.194.126.224/clientes_chatbot/cliente_"+userName+"/bot_sessions/baileys_store.json" },
-      url_qr: { S: "http://44.194.126.224/clientes_chatbot/cliente_"+userName+"/bot.qr.png" },
-      url_qr_sending: { S: "" },
-      timestamp: { S: new Date().toISOString() }
-    }
-  };
-  
-            console.log("params_message : ",params_message)
-
-  
-  const params_whitelist = {
-    TableName: table_whatsapp_whitelist,
-    Item: {
-      email: { S: email },
-      whitelist: { S: "" }
-    }
-  };
-  
-              console.log("params_message : ",params_whitelist)
-              
-              
-              
-              
-  const params_free_try = {
-    TableName: table_whatsapp_free_try,
-    Item: {
-      email: { S: email },
-      finish_free_try: { S: getTodayDate() },
-    }
-  };
-  
-          console.log("params_free_try : ",params_free_try)
-          
-const datePeriodPremiun = new Date();
-const finishPeriodDays = free_try ? 2 : 30;
-const finish_period = new Date(datePeriodPremiun.getTime() + finishPeriodDays * 24 * 60 * 60 * 1000);
-          
-const params_whatsapp_premiun = {
-    TableName: table_whatsapp_premiun,
-    Item: {
-      email: { S: email },
-      plan: { S: "Enterprise" },
-      finish_period: { S: finish_period.toISOString() }
-    }
-  };
-  
-    console.log("params_whatsapp_premiun : ",params_whatsapp_premiun)
-
-
-
-  try {
-    const getSetting = await getItemFromDynamoDB(table_whatsapp_setting,email);
-
-    if(port !== undefined && port !== null && String(port).trim() !== ""){
-      port_set = String(port);
-    }else if (getSetting?.port) {
-      port_set = String(getSetting.port);
-    }else{
-      port_set = await getMaxPortPm2Instance();
-      port_set = String(port_set);
-    }
-
-    let pm2status = (pm2 || free_try) ? "Activo":"Apagada";
-
-    const params = {
-      TableName: table_whatsapp_setting,
-      Item: {
-        email: { S: email },
-        credit: { N: String(safeCredit + 20) },
-        port: { S: port_set },
-        template: { S: template },
-        status_pm2: { S: pm2status },
-        timestamp: { S: new Date().toISOString() }
-      }
-    };
-
-    console.log("resolved_port :", { email, bodyPort: port, settingPort: getSetting?.port, port_set });
-    console.log("params : ",params)
-
-    // Ejecuta la operación PutItem en DynamoDB
-    if(!getSetting){
-      const command = new PutItemCommand(params);
-      await dynamoDBClient.send(command);
-    }else{
-      let total = free_try ? 20 : safeCredit;
-      let pm2status = (pm2 || free_try) ? "Activo":"Apagada";
-      console.log("pm2 || free_try:",{pm2,free_try})
-      console.log("pm2status:",pm2status)
-      const params = {
-        TableName: table_whatsapp_setting,
-        Item: {
-          email: { S: email },
-          credit: { N: String(total) },
-            port: { S: port_set },
-          status_pm2: { S: pm2status },
-          timestamp: { S: new Date().toISOString() }
-        }
-      };
-          console.log("params_whatsapp_setting update : ",params)
-      const command = new PutItemCommand(params);
-      await dynamoDBClient.send(command);
-          console.log("paso params free_try")
-      if(total > 20 || pm2status === "Apagada"){
-        await dynamoDBClient.send(new DeleteItemCommand({
-          TableName: "whatsapp_free_try",
-          Key: {
-            email: { S: email }
-          }
-        }));
-      }
-
-    }
-    
-    
-    // Ejecuta la operación PutItem en DynamoDB
-    const getPrompt = await getItemFromDynamoDB(params_prompt.TableName,email);
-    console.log("paso params_prompt")
-    if(!getPrompt){
-      const command_params_prompt = new PutItemCommand(params_prompt);
-      await dynamoDBClient.send(command_params_prompt);
-    }
-    
-    
-    
-    // Ejecuta la operación PutItem en DynamoDB
-    const getStatus = await getItemFromDynamoDB(params_status.TableName,email);
-        console.log("paso params_status")
-    if(!getStatus){
-      const command_params_status = new PutItemCommand(params_status);
-      await dynamoDBClient.send(command_params_status);
-    }
-    
-    
-    // Ejecuta la operación PutItem en DynamoDB
-    const getAlarm = await getItemFromDynamoDB(params_alarm.TableName,email);
-        console.log("paso params_alarm")
-    if(!getAlarm){
-      const command_params_alarm = new PutItemCommand(params_alarm);
-      await dynamoDBClient.send(command_params_alarm);
-    }
-    
-    // Ejecuta la operación PutItem en DynamoDB
-    const getMessage = await getItemFromDynamoDB(params_message.TableName,email);
-            console.log("paso params_message")
-    if(!getMessage){
-      const command_params_message = new PutItemCommand(params_message);
-      await dynamoDBClient.send(command_params_message);
-    }
-    
-     // Ejecuta la operación PutItem en DynamoDB
-    const getWhitelist = await getItemFromDynamoDB(params_whitelist.TableName,email);
-                console.log("paso params_whitelist")
-    if(!getWhitelist){
-      const command_params_whitelist = new PutItemCommand(params_whitelist);
-      await dynamoDBClient.send(command_params_whitelist);
-    }
-    
-    // Ejecuta la operación PutItem en DynamoDB
-    if(free_try){
-      const getFreeTry = await getItemFromDynamoDB(params_free_try.TableName,email);
-                      console.log("paso params_free_try")
-      if(!getFreeTry){
-        const command_params_free_try = new PutItemCommand(params_free_try);
-        await dynamoDBClient.send(command_params_free_try);
-      }
-    }
-    
-    // Ejecuta la operación PutItem en DynamoDB
-  
-    const getPremiun = await getItemFromDynamoDB(params_whatsapp_premiun.TableName,email);
-                          console.log("paso params_whatsapp_premiun", { email, free_try, finishPeriodDays, hasPremiun: !!getPremiun })
-    const command_params_whatsapp_premiun = new PutItemCommand(params_whatsapp_premiun);
-    await dynamoDBClient.send(command_params_whatsapp_premiun);
-    
-    
-    if(pm2 && !api || free_try && !api){
-                                console.log("paso createPM2Instance")
-      await createPM2Instance(email,userName,port_set,template);
-    }
-    
-    return {
-      headers: {
-            "Access-Control-Allow-Origin": "*", // Or specify your domain
-            "Access-Control-Allow-Headers": "Content-Type",
-            "Access-Control-Allow-Methods": "POST"
-        },
-      statusCode: 200,
-      body: JSON.stringify({ message: 'Item successfully added to DynamoDB' })
-    };
-  } catch (error) {
-    console.error('Error putting item into DynamoDB', error);
-    return {
-      headers: {
-            "Access-Control-Allow-Origin": "*", // Or specify your domain
-            "Access-Control-Allow-Headers": "Content-Type",
-            "Access-Control-Allow-Methods": "POST"
-        },
-      statusCode: 500,
-      body: JSON.stringify({ message: 'Error putting item into DynamoDB', error: error.message })
-    };
-  }
+// Etiquetas legibles para los encabezados de la hoja
+const HEADER_LABELS = {
+  "Precio divisas (USD)": "Precio en divisas",
+  "Precio a tasa BCV (ref. USD)": "Precio normal en dólares"
 };
 
+// Valores vacíos o de marcador que no deben aparecer
+const PLACEHOLDERS = [
+  "no registra informacion",
+  "sin informacion",
+  "no aplica",
+  "n/a",
+  "na",
+  "-"
+];
 
-function getTodayDate() {
-    let date = new Date();
-    
-    // Sumar 2 días
-    date.setDate(date.getDate() + 2);
+const dynamodb = new DynamoDBClient({});
 
-    // Obtener los componentes de la fecha
-    let year = date.getFullYear();
-    let month = String(date.getMonth() + 1).padStart(2, '0'); // Meses son base 0
-    let day = String(date.getDate()).padStart(2, '0');
+// ==========================================
+// UTILIDADES
+// ==========================================
 
-    return `${year}-${month}-${day}`;
+function clean(value) {
+  return String(value ?? "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function getNameUser(email) {
-    let part = email.split('@');
-    if (part.length > 1) {
-        // Reemplaza todos los puntos en la parte del nombre de usuario
-        let username = part[0].replace(/\./g, '');
-        return username;
-    } else {
-        throw new Error('El formato del correo no es válido.');
+function isPlaceholder(value) {
+  return PLACEHOLDERS.includes(
+    clean(value).toLowerCase()
+  );
+}
+
+function response(statusCode, data) {
+  return {
+    statusCode,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8"
+    },
+    body: JSON.stringify(data)
+  };
+}
+
+// ==========================================
+// LEER CSV DE GOOGLE SHEETS
+// ==========================================
+
+function parseCSV(text) {
+  text = text.replace(/^\uFEFF/, "");
+
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+
+    if (quoted) {
+      if (char === '"' && text[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        field += char;
+      }
+
+      continue;
     }
-}
 
-
-
-async function getTemplateFromS3(){
-     // Configura el bucket y el nombre del archivo que deseas leer
-    const bucketName = 'templateemail';
-    const key = 'PROMPT_BASE.json'; // Ruta del archivo HTML dentro del bucket
-
-    const params = {
-        Bucket: bucketName,
-        Key: key
-    };
-
-    try {
-        // Lee el archivo desde S3 usando el nuevo cliente y comando
-        const command = new GetObjectCommand(params);
-        const data = await s3.send(command);
-
-        // El contenido del archivo está en el stream de `Body`, lo convertimos a texto
-        const stream = data.Body;
-        const htmlContent = await streamToString(stream); // Convertir stream a string
-
-        // Opcional: haz algo con el contenido, como devolverlo o procesarlo
-        return JSON.parse(htmlContent)
-    } catch (err) {
-        console.error("Error al obtener el archivo de S3:", err);
-        return null;
+    if (char === '"') {
+      quoted = true;
+    } else if (char === ",") {
+      row.push(field);
+      field = "";
+    } else if (char === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (char !== "\r") {
+      field += char;
     }
+  }
+
+  if (quoted) {
+    throw new Error("CSV inválido");
+  }
+
+  if (row.length || field !== "") {
+    row.push(field);
+    rows.push(row);
+  }
+
+  return rows;
 }
 
-const streamToString = (stream) => {
-    return new Promise((resolve, reject) => {
-        const chunks = [];
-        stream.on('data', (chunk) => chunks.push(chunk));
-        stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-        stream.on('error', reject);
-    });
-};
+// ==========================================
+// OBTENER HEADERS Y FILAS DE LA HOJA
+// ==========================================
 
-async function createPM2Instance(email,userName,port,template){
-  
-  const raw = JSON.stringify({
-    id: userName,
-    name: userName,
-    email: email,
-    port: port,
-    template: template
+async function getSheetData() {
+  const url =
+    `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHEET_GID}`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    headers: {
+      Accept: "text/csv"
+    },
+    signal: AbortSignal.timeout(30000)
   });
-  
-  const apiUrl = "http://44.194.126.224:4000/clientes/create"; // Reemplaza con la URL de tu API
-  const requestOptions = {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json", // Asegura que el contenido sea JSON
-      },
-      body: raw
-    };
-  
-  try {
-    const response = await global.fetch(apiUrl, requestOptions);
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    const data = await response.json();
-    console.log("Success:", data);
-    await notificationAddCredit(email)
-  } catch (error) {
-    console.error("Error:", error);
+
+  if (!res.ok) {
+    throw new Error(
+      `Google Sheets HTTP ${res.status}`
+    );
   }
 
-}
+  const csv = await res.text();
 
-
-async function getMaxPortPm2Instance(){
-   try {
-    const params = {
-      TableName: 'whatsapp_setting',
-      ProjectionExpression: 'port',
-    };
-
-    const command = new ScanCommand(params);
-    const data = await dynamoDBClient.send(command);
-
-    // Suponiendo que los valores de 'port' son strings que pueden ser convertidos a números para comparar
-    const ports = data.Items
-      .filter(item => item.port && item.port.S)
-      .map(item => parseInt(item.port.S, 10));
-      
-    let maxPort = Math.max(...ports);
-
-    return (maxPort+1);
-  } catch (error) {
-    console.log("Error getMaxPortPm2Instance: ",error)
-    return null
+  if (
+    csv.length > 5000000 ||
+    /<html|<!doctype html/i.test(
+      csv.slice(0, 500)
+    )
+  ) {
+    throw new Error(
+      "Google Sheets no devolvió CSV válido"
+    );
   }
-}
 
+  const table = parseCSV(csv).filter(row =>
+    row.some(cell => clean(cell) !== "")
+  );
 
-async function getItemFromDynamoDB(tableName, email) {
-  const params = {
-    TableName: tableName,
-    Key: {
-      email: { S: email }
-    }
-  };
-
-  try {
-    const command = new GetItemCommand(params);
-    const data = await dynamoDBClient.send(command);
-    
-    if (!data.Item) {
-      return null;
-    }
-
-    const result = unmarshall(data.Item);
-    return result;
-  } catch (error) {
-    console.error("getItemFromDynamoDB: ",error);
-    return null;
+  if (table.length < 2) {
+    throw new Error(
+      "Google Sheets vacío o sin filas de datos"
+    );
   }
-}
 
-async function replaceTemplateWithData(template, variables) {
-    return template.replace(/{(.*?)}/g, (match, key) => {
-        // Retorna el valor correspondiente de las variables o el match original si no encuentra el valor
-        return variables[key] || match;
+  const headers = table[0].map(header =>
+    clean(header)
+  );
+
+  const rows = table.slice(1).map(row => {
+    const item = {};
+
+    headers.forEach((header, index) => {
+      item[header] = clean(row[index]);
     });
+
+    return item;
+  });
+
+  console.log(
+    "Headers Google Sheets:",
+    JSON.stringify(headers)
+  );
+
+  console.log(
+    "Filas Google Sheets:",
+    rows.length
+  );
+
+  return { headers, rows };
 }
 
+// ==========================================
+// GENERAR STRING MARKDOWN
+// ==========================================
 
-async function notificationAddCredit(email){
-  
-  const variables = {
-        name: email
-    };
-  
-  try{
-          const s3Html = await getTemplateFromS3Credit();
-          const HTMLBody = await replaceTemplateWithData(s3Html,variables)
-          const response_email = await sendMailjetRequest(email,HTMLBody);
-          
-        console.log("email enviado",response_email)
+// Primer valor no vacío de una columna
+function firstValue(rows, column) {
+  for (const row of rows) {
+    const value = row[column];
 
-      } catch (error) {
-        console.error("Error email enviado",error)
+    if (value && !isPlaceholder(value))
+      return value;
+  }
+
+  return "";
+}
+
+function buildMarkdown(headers, rows) {
+  // Agrupar por Producto (columna B) y Modelo (columna C)
+  const groups = new Map();
+
+  // Columnas que no se listan como datos simples
+  const structuralColumns = new Set([
+    PRODUCT_COLUMN,
+    MODEL_COLUMN,
+    COLOR_COLUMN,
+    SIZE_COLUMN,
+    STOCK_COLUMN,
+    LINK_COLUMN,
+    SKIP_COLUMN,
+    ...IGNORED_COLUMNS
+  ]);
+
+  for (const row of rows) {
+    const product =
+      row[PRODUCT_COLUMN] || "SIN PRODUCTO";
+
+    const model =
+      row[MODEL_COLUMN] || "";
+
+    if (!groups.has(product))
+      groups.set(product, new Map());
+
+    const models = groups.get(product);
+
+    if (!models.has(model))
+      models.set(model, []);
+
+    models.get(model).push(row);
+  }
+
+  const lines = [
+    "## INFORMACIÓN DEL CATÁLOGO",
+    "",
+    "- Los datos provienen del inventario en Google Sheets.",
+    "- No inventar productos, precios ni características.",
+    "- «Precio en divisas»: aplica a Binance y a dólares en efectivo; no se indica en bolívares.",
+    "- «Precio normal en dólares»: aplica a Pago Móvil y Transferencia.",
+    ""
+  ];
+
+  for (
+    const product of [...groups.keys()]
+      .sort((a, b) => a.localeCompare(b, "es"))
+  ) {
+    lines.push(`## ${product}`, "");
+
+    const models = groups.get(product);
+
+    for (
+      const model of [...models.keys()]
+        .sort((a, b) => a.localeCompare(b, "es"))
+    ) {
+      const items = models.get(model);
+
+      // Solo se crea el subtítulo cuando hay modelo;
+      // si no, la ficha queda bajo el producto.
+      if (model)
+        lines.push(`### ${model}`);
+
+      // Disponibilidad desglosada por color y talla
+      const stock = new Map();
+
+      for (const row of items) {
+        const color =
+          row[COLOR_COLUMN] || "Sin color";
+
+        if (!stock.has(color))
+          stock.set(color, []);
+
+        stock.get(color).push({
+          size: row[SIZE_COLUMN] || "",
+          qty: row[STOCK_COLUMN] || "0"
+        });
       }
-      
+
+      if (stock.size) {
+        lines.push(
+          "- Disponibilidad (color/talla):"
+        );
+
+        for (
+          const color of [...stock.keys()]
+            .sort((a, b) =>
+              a.localeCompare(b, "es")
+            )
+        ) {
+          const entries = stock
+            .get(color)
+            .sort((a, b) =>
+              a.size.localeCompare(b.size, "es", {
+                numeric: true
+              })
+            )
+            .map(entry =>
+              entry.size
+                ? `${entry.size} (${entry.qty})`
+                : entry.qty
+            );
+
+          lines.push(
+            `  - ${color}: ${entries.join(", ")}`
+          );
+        }
+      }
+
+      // Enlaces por color (cada modelo+color con su link,
+      // dentro de una sola ficha de producto + modelo)
+      const linksByColor = new Map();
+
+      for (const row of items) {
+        const link = row[LINK_COLUMN];
+
+        if (!link || isPlaceholder(link))
+          continue;
+
+        const color = row[COLOR_COLUMN] || "";
+
+        if (!linksByColor.has(color))
+          linksByColor.set(color, new Set());
+
+        linksByColor.get(color).add(link);
+      }
+
+      if (linksByColor.size) {
+        // Sin variantes de color: link directo
+        if (linksByColor.size === 1 && linksByColor.has("")) {
+          lines.push(
+            `- imagen: ${[...linksByColor.get("")].join(" | ")}`
+          );
+        } else {
+          lines.push("- imagen:");
+
+          for (
+            const color of [...linksByColor.keys()]
+              .sort((a, b) =>
+                a.localeCompare(b, "es")
+              )
+          ) {
+            lines.push(
+              `  - ${color || model || product}: ${[...linksByColor.get(color)].join(" | ")}`
+            );
+          }
+        }
+      }
+
+      // Datos compartidos del modelo
+      for (const header of headers) {
+        if (structuralColumns.has(header))
+          continue;
+
+        const value = firstValue(
+          items,
+          header
+        );
+
+        if (!value)
+          continue;
+
+        const label =
+          HEADER_LABELS[header] || header;
+
+        lines.push(`- ${label}: ${value}`);
+      }
+
+      lines.push("");
+    }
+  }
+
+  return lines.join("\n").trim();
 }
 
+// ==========================================
+// DYNAMODB GETITEM
+// ==========================================
 
+async function getPromptItem() {
+  const data = await dynamodb.send(
+    new GetItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        [PK_NAME]: { S: PK_VALUE }
+      },
+      ConsistentRead: true
+    })
+  );
 
+  if (!data.Item) {
+    throw new Error(
+      `No existe ${PK_VALUE} en ${TABLE_NAME}`
+    );
+  }
 
-// Función que envía la solicitud a Mailjet usando fetch
-async function sendMailjetRequest(email_send,HTMLBody) {
-    const emailUrl = "https://api.mailjet.com/v3.1/send";
-    const mailjetKey = "8510f9d132fdd92df7c341f51d282dd8:c4997e20d75626f02ab545a2efa6515a";
-    const emailFrom = "admin@telknec.cl";
-    const emailTo = email_send;
+  return data.Item;
+}
 
-    // Utiliza la función `bodyMailJet` de tu utilidad
-    const body = bodyMailJet(
-        emailFrom,
-        emailTo,
-        "Chat Bot Whatsapp Activo",
-        "Chat Bot Whatsapp Activo",
-        HTMLBody
+// ==========================================
+// DYNAMODB UPDATE SOLO PRODUCTS
+// ==========================================
+
+async function updateProducts(markdown) {
+  await dynamodb.send(
+    new UpdateItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        [PK_NAME]: { S: PK_VALUE }
+      },
+      UpdateExpression:
+        "SET #products = :value",
+      ConditionExpression:
+        "attribute_exists(#pk)",
+      ExpressionAttributeNames: {
+        "#products": "products",
+        "#pk": PK_NAME
+      },
+      ExpressionAttributeValues: {
+        ":value": { S: markdown }
+      },
+      ReturnValues: "NONE"
+    })
+  );
+}
+
+// ==========================================
+// LAMBDA HANDLER
+// ==========================================
+
+export const handler = async (
+  event = {},
+  context
+) => {
+  try {
+    const input =
+      typeof event.body === "string"
+        ? JSON.parse(event.body || "{}")
+        : event.body &&
+          typeof event.body === "object"
+          ? event.body
+          : event;
+
+    const dryRun = input?.dryRun === true;
+
+    console.log(
+      "Iniciando sincronización desde Google Sheets"
     );
 
-    try {
-        const response = await global.fetch(emailUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': 'Basic ' + Buffer.from(mailjetKey).toString('base64') // Codificar en base64 el USERPWD
-            },
-            body: JSON.stringify(body)
-        });
+    // 1. VERIFICAR REGISTRO
 
-        if (!response.ok) {
-            const errorDetails = await response.text(); // O response.json() si esperas un JSON
-            throw new Error(`Error en la solicitud email: ${errorDetails}`);
-        }
+    await getPromptItem();
 
-        const result = await response.json();
-        console.log("Response data email:", result);
-        return result;
+    // 2. LEER HEADERS Y FILAS DE GOOGLE SHEETS
 
-    } catch (error) {
-        console.error("Error al enviar la solicitud a Mailjet:", error);
-        throw new Error(`Try Error en la solicitud email: ${error}`);
+    const { headers, rows } =
+      await getSheetData();
+
+    if (!rows.length) {
+      throw new Error(
+        "Google Sheets sin filas de datos"
+      );
     }
-}
 
-function bodyMailJet(from, to, senderName, subject, body) {
-    return {
-        Messages: [
-            {
-                From: {
-                    Email: from,
-                    Name: senderName
-                },
-                To: [
-                    {
-                        Email: to,
-                        Name: senderName
-                    }
-                ],
-                Subject: subject,
-                HTMLPart: body
-            }
-        ]
-    };
-}
+    // 3. GENERAR MARKDOWN
 
+    const markdown = buildMarkdown(
+      headers,
+      rows
+    );
 
-async function getTemplateFromS3Credit(){
-     // Configura el bucket y el nombre del archivo que deseas leer
-    const bucketName = 'templateemail';
-    const key = 'credits.html'; // Ruta del archivo HTML dentro del bucket
+    const bytes = Buffer.byteLength(
+      markdown,
+      "utf8"
+    );
 
-    const params = {
-        Bucket: bucketName,
-        Key: key
-    };
+    // 4. IMPRIMIR RESULTADO EN LOGS
 
-    try {
-        // Lee el archivo desde S3 usando el nuevo cliente y comando
-        const command = new GetObjectCommand(params);
-        const data = await s3.send(command);
+    console.log("Markdown generado:");
+    console.log(markdown);
 
-        // El contenido del archivo está en el stream de `Body`, lo convertimos a texto
-        const stream = data.Body;
-        const htmlContent = await streamToString(stream); // Convertir stream a string
+    console.log({
+      total_filas: rows.length,
+      markdown_bytes: bytes
+    });
 
-        // Opcional: haz algo con el contenido, como devolverlo o procesarlo
-        return htmlContent
-    } catch (err) {
-        console.error("Error al obtener el archivo de S3:", err);
-        return null;
+    // 5. VALIDAR TAMAÑO
+
+    if (bytes > MAX_MARKDOWN_BYTES) {
+      throw new Error(
+        `Markdown demasiado grande: ${bytes} bytes`
+      );
     }
-}
+
+    // 6. MODO PRUEBA
+
+    if (dryRun) {
+      return response(200, {
+        success: true,
+        dryRun: true,
+        total_filas: rows.length,
+        markdown_bytes: bytes,
+        preview: markdown.slice(0, 10000)
+      });
+    }
+
+    // 7. ACTUALIZAR SOLO PRODUCTS
+
+    await updateProducts(markdown);
+
+    return response(200, {
+      success: true,
+      table: TABLE_NAME,
+      pk: PK_VALUE,
+      updated_field: "products",
+      total_filas: rows.length,
+      markdown_bytes: bytes,
+      message:
+        "Catálogo actualizado correctamente"
+    });
+
+  } catch (error) {
+    console.error(error);
+
+    return response(500, {
+      success: false,
+      table: TABLE_NAME,
+      pk: PK_VALUE,
+      updated_field: "products",
+      message:
+        "No fue posible completar la sincronización",
+      error: error.message
+    });
+  }
+};

@@ -12,6 +12,7 @@ let client;
 let runtime;
 let server;
 let stopping = false;
+const processStartedAt = Date.now();
 const qrPath = path.resolve(__dirname, '../bot.qr.png');
 
 function clearQr() {
@@ -55,6 +56,7 @@ async function main() {
     session: config.session, sessionDirectory: config.folderNameToken,
     envFile: envPath,
     headless: config.headless, apiHost: config.apiHost, apiPort: config.apiPort,
+    insecureChromiumArgs: config.insecureChromiumArgs,
     silenceTextAudioSeconds: process.env.SILENCE_TEXT_AUDIO_SECONDS || '5',
     silenceImageSeconds: 45, model: 'gpt-5-mini',
     openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
@@ -71,11 +73,14 @@ async function main() {
     session: config.session,
     headless: config.headless,
     autoClose: config.autoClose,
+    // Evita la consulta bloqueante al registro de npm al iniciar.
+    updatesLog: false,
+    useInsecureChromiumArgs: config.insecureChromiumArgs,
     tokenStore: 'file',
     folderNameToken: config.folderNameToken,
     logQR: false,
     catchQR: (base64Qr, asciiQR, attempts) => {
-      console.log(`\nQR disponible (intento ${attempts}). Escanéalo desde WhatsApp:\n${asciiQR}`);
+      console.log(`\nQR disponible (intento ${attempts}, ${Date.now() - processStartedAt} ms). Escanéalo desde WhatsApp:\n${asciiQR}`);
       const image = /^data:image\/png;base64,(.+)$/s.exec(base64Qr || '');
       if (!image) {
         console.error('No se recibió una imagen PNG válida del QR. Usa el código de la terminal.');
@@ -106,8 +111,8 @@ async function main() {
 
   runtime = await createBusinessRuntime(client, business);
   runtime.attach();
-  business.logger.info('Bot iniciado', { port: process.env.PORT || 3000, apiPort: config.apiPort });
-  console.log('Bot conectado. Flujos de texto, audio e imágenes activos con WPPConnect.');
+  business.logger.info('Bot iniciado', { port: process.env.PORT || 3000, apiPort: config.apiPort, startupMs: Date.now() - processStartedAt });
+  console.log(`Bot conectado en ${Date.now() - processStartedAt} ms. Flujos de texto, audio e imágenes activos con WPPConnect.`);
 }
 
 main().catch((error) => {

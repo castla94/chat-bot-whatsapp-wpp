@@ -15,10 +15,15 @@ if (!Number.isSafeInteger(autoClose) || autoClose < 0) {
   throw new Error('WPP_AUTO_CLOSE debe ser un entero mayor o igual a 0.');
 }
 
+// Añade --no-sandbox y --disable-setuid-sandbox: acelera el arranque de Chromium
+// en servidores/contenedores donde se ejecuta como root.
+const insecureChromiumArgs = process.env.WPP_INSECURE_ARGS === 'true';
+
 module.exports = {
   session,
   headless: headless === 'true',
   autoClose,
+  insecureChromiumArgs,
   folderNameToken: path.resolve(__dirname, '../bot_sessions'),
   browserPath: process.env.WPP_BROWSER_PATH || undefined,
   apiPort: readPort(process.env.API_PORT ?? (Number(process.env.PORT || 3000) + 10000)),
