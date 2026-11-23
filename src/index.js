@@ -52,6 +52,7 @@ async function main() {
     fs.mkdirSync(path.resolve(__dirname, '..', directory), { recursive: true });
   }
   const business = await loadBusiness();
+  console.log(`Módulos internos cargados en ${Date.now() - processStartedAt} ms.`);
   business.logger.info('Configuración activa del bot', {
     session: config.session, sessionDirectory: config.folderNameToken,
     envFile: envPath,
@@ -67,7 +68,7 @@ async function main() {
   server = await startServer(() => runtime, config);
   console.log(`API de envío disponible en el puerto ${config.apiPort}.`);
   clearQr();
-  console.log('Iniciando WhatsApp. Escanea el QR desde Dispositivos vinculados.');
+  console.log(`Lanzando Chromium (${Date.now() - processStartedAt} ms desde el arranque)...`);
   client = await wppconnect.create({
     session: config.session,
     headless: config.headless,
@@ -100,9 +101,9 @@ async function main() {
       puppeteerOptions: { executablePath: config.browserPath },
     }),
     statusFind: (status, session) => {
-      console.log(`[${session}] Estado: ${status}`);
+      console.log(`[${session}] Estado: ${status} (+${Date.now() - processStartedAt} ms)`);
       if (status === 'notLogged') {
-        console.log('Esperando el QR de WhatsApp; puede tardar unos segundos.');
+        console.log(`Esperando el QR de WhatsApp; Chromium tardó ${Date.now() - processStartedAt} ms en arrancar y cargar WhatsApp Web.`);
       }
       if (['qrReadSuccess', 'isLogged', 'autocloseCalled', 'browserClose'].includes(status)) {
         clearQr();

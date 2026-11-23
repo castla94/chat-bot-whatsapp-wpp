@@ -10,7 +10,9 @@ if (!['true', 'false'].includes(headless)) {
   throw new Error('WPP_HEADLESS debe ser true o false.');
 }
 
-const autoClose = Number(process.env.WPP_AUTO_CLOSE ?? 120000);
+// 0 (por defecto) desactiva el cierre automático: el QR se sigue regenerando
+// hasta que la cuenta se conecte.
+const autoClose = Number(process.env.WPP_AUTO_CLOSE ?? 0);
 if (!Number.isSafeInteger(autoClose) || autoClose < 0) {
   throw new Error('WPP_AUTO_CLOSE debe ser un entero mayor o igual a 0.');
 }
