@@ -2,6 +2,8 @@ const paymentHeading = /^(?:datos de pago(?:\s*(?:[-–—:]\s*)?pago m[oó]vil)
 const bankField = /^(?:banco|c[oó]digo(?: del)? banco)\s*[:\-]/i
 const phoneField = /^(?:tel[eé]fono|celular|n[uú]mero de tel[eé]fono)\s*[:\-]/i
 const idField = /^(?:c[eé]dula(?: de identidad)?|c\.?\s*i\.?)\s*[:\-]/i
+const paymentAmountField = /^monto a pagar\s*:\s*(?:bs\.?|ves)\s*([\d.,]+)$/i
+const orderAmountField = /^total a pagar en bol[ií]vares\s*:\s*(?:(?:bs\.?|ves)\s*)?([\d.,]+)$/i
 
 export function splitMobilePayment(response) {
     if (process.env.PAGO_MOVIL?.trim().toLowerCase() !== 'true') return [response]
@@ -43,5 +45,13 @@ export function splitMobilePayment(response) {
     const confirmation = lines.filter((_, index) => !paymentIndexes.has(index))
         .join('\n').replace(/\n(?:[ \t]*\n){2,}/g, '\n\n').trim()
 
-    return [confirmation, [idNumber, bankCode, phoneNumber].join('\n')]
+    const paymentAmount = fields.slice(headingIndex + 1)
+        .map(line => line.match(paymentAmountField)?.[1]).find(Boolean)
+    const orderAmount = fields.slice(0, headingIndex)
+        .map(line => line.match(orderAmountField)?.[1]).find(Boolean)
+    const amount = paymentAmount ?? orderAmount
+    const copyablePayment = [idNumber, bankCode, phoneNumber]
+    if (amount) copyablePayment.push(amount)
+
+    return [confirmation, copyablePayment.join('\n')]
 }
