@@ -51,7 +51,7 @@ test('separa los datos de pago en el orden cédula, banco, teléfono y monto', (
 
   assert.deepEqual(splitMobilePayment(response), [
     [order, paymentInstructions].join('\n\n'),
-    '29792586\n0102\n04126882144\n6,431.36',
+    '29792586\n0102\n04126882144\n6431,36',
   ]);
 });
 
@@ -59,14 +59,14 @@ test('usa el total en bolívares si falta el monto del bloque de pago', () => {
   process.env.PAGO_MOVIL = 'TRUE';
   const withoutPaymentAmount = response.replace('Monto a pagar: Bs. 6,431.36\n', '');
 
-  assert.equal(splitMobilePayment(withoutPaymentAmount)[1], '29792586\n0102\n04126882144\n6,431.36');
+  assert.equal(splitMobilePayment(withoutPaymentAmount)[1], '29792586\n0102\n04126882144\n6431,36');
 });
 
 test('prioriza el monto del bloque de pago sobre el total del pedido', () => {
   process.env.PAGO_MOVIL = 'TRUE';
-  const withDifferentAmount = response.replace('Monto a pagar: Bs. 6,431.36', 'Monto a pagar: Bs. 500,00');
+  const withDifferentAmount = response.replace('Monto a pagar: Bs. 6,431.36', 'Monto a pagar: Bs. 1.500,00');
 
-  assert.equal(splitMobilePayment(withDifferentAmount)[1], '29792586\n0102\n04126882144\n500,00');
+  assert.equal(splitMobilePayment(withDifferentAmount)[1], '29792586\n0102\n04126882144\n1500,00');
 });
 
 test('envía la respuesta completa con PAGO_MOVIL desactivado', () => {

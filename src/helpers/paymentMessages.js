@@ -5,6 +5,14 @@ const idField = /^(?:c[eé]dula(?: de identidad)?|c\.?\s*i\.?)\s*[:\-]/i
 const paymentAmountField = /^monto a pagar\s*:\s*(?:bs\.?|ves)\s*([\d.,]+)$/i
 const orderAmountField = /^total a pagar en bol[ií]vares\s*:\s*(?:(?:bs\.?|ves)\s*)?([\d.,]+)$/i
 
+function formatPaymentAmount(amount) {
+    const decimal = amount.match(/[.,](\d{1,2})$/)
+    if (!decimal) return amount.replace(/[.,]/g, '')
+
+    const integer = amount.slice(0, decimal.index).replace(/[.,]/g, '')
+    return `${integer},${decimal[1]}`
+}
+
 export function splitMobilePayment(response) {
     if (process.env.PAGO_MOVIL?.trim().toLowerCase() !== 'true') return [response]
 
@@ -51,7 +59,7 @@ export function splitMobilePayment(response) {
         .map(line => line.match(orderAmountField)?.[1]).find(Boolean)
     const amount = paymentAmount ?? orderAmount
     const copyablePayment = [idNumber, bankCode, phoneNumber]
-    if (amount) copyablePayment.push(amount)
+    if (amount) copyablePayment.push(formatPaymentAmount(amount))
 
     return [confirmation, copyablePayment.join('\n')]
 }
